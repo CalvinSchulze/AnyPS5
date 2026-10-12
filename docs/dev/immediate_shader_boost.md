@@ -181,29 +181,68 @@ Dazu passen die gemessenen 34 % Bit-Manipulation im emittierten Code: Sub-Dword-
 (Stride 1 und 2 Byte) auf format-spezialisierte Buffer werden mit Shift/Mask/Select
 nachgebaut.
 
-## Offen — eine Frage, kein Suchfeld
+## Hypothese: die geschriebenen Buffer liegen im Host-Speicher
 
-Die verbleibende Unbekannte ist, ob der Pro-Zugriff-Overhead aus **Instruktionszahl**
-oder aus **Latenz/Occupancy** kommt. Das entscheidet zwischen zwei völlig verschiedenen
-Fixes und lässt sich in-project nicht trennen — das Projekt hat kein
-`VK_KHR_performance_query`.
+Der Mechanismus ist im Projekt bereits beschrieben — `GuestBufferMemory.cpp:2138`:
 
-**B — Nsight Compute oder Nsight Graphics GPU Trace auf den Dispatch von
-`0x800038be00`.** Konkrete Frage: SM-Throughput gegen Memory-Throughput, Occupancy,
-und die Stall-Gründe an den Buffer-Load-Stellen. `sm__inst_executed` geteilt durch
-8.294.400 gibt zusätzlich die real ausgeführten Instruktionen pro Invocation.
+> *"A written V# element bound in place makes the shader store into host memory over
+> PCIe: the froxel culling kernel's ~248K scattered 4-byte stores took 2.8 ms per
+> dispatch and the histogram kernels' ~60K atomics on a 1 KB bin table 1.4 ms, on a GPU
+> that is otherwise idle."*
 
-**C — flankierend, in-project:** `APS5_SINGLE_LANE=800038be00` preist die gemessenen
-1,90x Codegröße in Millisekunden um (`HostSubgroupSize`, `Recompiler.cpp:84`, matcht die
-Adresse als Teilzeichenkette). Semantik ändert sich dabei (Cross-Lane über Workgroup-
-statt Subgroup-Scope), Bild also auf Korrektheit prüfen. Nach dem Befund oben ist davon
-wenig zu erwarten — Codegröße erklärt die Kosten nicht —, aber es ist ein Lauf.
+Die Gegenmaßnahme ist das **Written-Shadow-Staging**: ein geschriebenes Element wird in
+einen `DEVICE_LOCAL`-Buffer kopiert, dort gebunden und zurückkopiert. Sie ist aber
+größenbegrenzt (`stagingEligible`, `GuestBufferMemory.cpp:2295`):
+
+```cpp
+return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
+```
+
+`APS5_WRITTEN_SHADOW_MIN_KIB` / `MAX_KIB` sind **16 / 2048 KiB**. Die geschriebenen
+Buffer von `0x800038be00` sind **16,6 / 8,2 / 4,1 / 4,1 MB** — alle vier liegen über dem
+2-MiB-Fenster und werden damit **in place gebunden**, also ins Host-RAM über PCIe
+geschrieben, von 8,29 Mio. Invocations mit einem Record pro Invocation.
+
+Für diesen Ausschluss gibt es **keinen Zähler** — die `0 shadows refused` auf der
+`[buffers]`-Zeile zählen etwas anderes, der Größenfilter greift stumm davor.
+
+Die Begründung der Obergrenze im Kommentar nimmt Streaming an („a kernel streaming once
+through a large buffer [...] would only gain the two copies"). Dieser Shader streamt
+nicht, er schreibt gestreut — genau der Fall, den derselbe Kommentar als katastrophal
+beschreibt.
+
+Das erklärt außerdem, warum die Kosten mit der **Buffer-Zahl** skalieren und nicht mit
+Codegröße, Invocations oder Schleifen, und warum die Bandbreite bei 0,5 GB/s brachliegt:
+PCIe-Latenz pro gestreutem Store, nicht Volumen.
+
+### Nächster Schritt — Dosis-Wirkungs-Kurve, kein Profiler
+
+`APS5_WRITTEN_SHADOW_MAX_KIB` stufenweise erhöhen, sodass die Buffer einzeln ins
+Staging-Fenster wandern, und jeweils `[gputime] by program` vergleichen:
+
+| `MAX_KIB` | zusätzlich gestaged | Erwartung bei zutreffender Hypothese |
+|---|---|---|
+| 2048 (Default) | — | Basislinie, ~4310 ms / 10 s |
+| 5120 | 2x 4,1 MB | erster Abfall |
+| 9216 | + 8,2 MB | weiterer Abfall |
+| 20480 | + 16,6 MB | größter Abfall |
+
+Gegenprobe in der anderen Richtung: `APS5_NO_WRITTEN_SHADOW=1` bindet **alle**
+geschriebenen Elemente in place, also auch die heute gestagten kleinen. Dann muss
+insbesondere `0x80003e8700` (3 Buffer, heute im Fenster) **schlechter** werden — trifft
+das nicht ein, ist die Hypothese falsch.
+
+`APS5_TRACE_STAGING=1` listet jede gestagte Range einmal mit Größe und zeigt direkt, ob
+die großen Buffer im Staging-Set auftauchen.
 
 **Methodik:** `[gputime]` aggregiert über 10-s-Fenster, Läufe müssen dieselbe Szene
-zeigen (gleicher Spielstand, Kamera geparkt, mehrere Fenster vergleichen), und der
-Shader-Disk-Cache muss gleich warm sein. `[gputime] by program` braucht
+zeigen (gleicher Spielstand, Kamera geparkt, die letzten Fenster vergleichen, nicht die
+ersten), und der Shader-Disk-Cache muss gleich warm sein. `[gputime] by program` braucht
 **`APS5_PROFILE_GPU`** (`Recorder.cpp:1800`); `APS5_PROFILE_DRAW` allein liefert nur die
 Batch-Stempel.
+
+Nsight bleibt die Rückfallebene, falls die Kurve flach bleibt: dann ist die Frage
+Instruktionszahl gegen Latenz, und das Projekt hat kein `VK_KHR_performance_query`.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
