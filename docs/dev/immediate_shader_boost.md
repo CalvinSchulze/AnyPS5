@@ -48,21 +48,22 @@ nicht an `BUILD_TESTING` gebunden). Braucht `libc.prx` im `PATH`
 (`build/core/libs/libs/unpatched`).
 
 **Vorhandene Sonden:** `APS5_DUMP_SHADERS=1`,
-`APS5_PROBE_DISPATCH=<hex>[:index]` (`Dispatch.cpp:112`), sowie eine hartcodierte
-Einmal-Ausgabe für genau diese Adresse in `VulkanDevice.cpp:3548` (aus `a589b5cf`) —
-druckt nur Grid und `indirect`, nicht die Workgroup-Größe, deshalb im Log-Auszug nicht
-enthalten.
+`APS5_PROBE_DISPATCH=<hex>[:index]` (`Dispatch.cpp:112`) und
+`APS5_TRACE_DISPATCH_GEOMETRY=<hex>` (`VulkanDevice.cpp`) — letztere liefert Grid,
+`indirect`, Subgroup-Größe, Workgroup-Memory und SPIR-V-Größe, einmal pro Programm;
+ein Wert unter acht Hex-Ziffern (auch `1`) meldet jedes Programm.
 
 ### Nächster Schritt — braucht einen Spiel-Lauf
 
 Blockiert: der `.req`-Dump entsteht nur im Recompile-Pfad einer echten Sitzung.
 
 ```
-APS5_DUMP_SHADERS=1 APS5_PROFILE_DRAW=1 .\app.exe
+APS5_DUMP_SHADERS=1 APS5_PROFILE_DRAW=1 APS5_TRACE_DISPATCH_GEOMETRY=800038be00 .\app.exe
 ```
 
-Der Dump landet als `shader_800038be00.req` im Arbeitsverzeichnis des Prozesses
-(`fopen` mit relativem Namen, eine Datei pro Adresse). Dann:
+Die Sonde druckt das Grid sofort; der Dump landet als `shader_800038be00.req` im
+Arbeitsverzeichnis des Prozesses (`fopen` mit relativem Namen, eine Datei pro
+Adresse). Dann:
 
 ```
 agc_shader_replay --asm --cfg shader_800038be00.req
