@@ -86,6 +86,9 @@ raw/
 images/
 sessions/
 downloads/
+_analytics/
+shader_*.req
+shader_cache/
 
 *.tar.gz
 *.zip
