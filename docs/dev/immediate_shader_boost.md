@@ -5,19 +5,20 @@
 
 ## Aktueller Stand
 
-Messgrundlage: `APS5_PROFILE_DRAW`-Sitzung, 38.441 Frames, ~94 min, **~6,8 fps**
-(68 Presents / 10 s, 148 ms pro Frame). Hardware: RTX 5080 (Host-Subgroup 32).
+Messgrundlage: Sitzung mit `APS5_PROFILE_GPU=1 APS5_PROFILE_DRAW=1
+APS5_TRACE_DISPATCH_GEOMETRY=1`, **~6,5 fps** (65 Presents / 10 s, 154 ms pro Frame).
+Hardware: RTX 5080, Host-Subgroup 32.
 
-Die GPU ist der Engpass, nicht CPU und nicht IO: `batch 8996 ms first to last command`
-pro 10-s-Fenster → **~90 % Wall-Clock-Belegung**. Datei-IO spielt keine Rolle.
+Die GPU ist der Engpass, nicht CPU und nicht IO: `batch 8869 ms first to last command`
+pro 10-s-Fenster → **~89 % Wall-Clock-Belegung**. Datei-IO spielt keine Rolle.
 
-GPU-Zeit ist extrem schief verteilt (6201 ms pro 10 s):
+GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 
 | Programm | pro 10 s | Anteil | pro Frame |
 |---|---|---|---|
-| `0x800038be00` | 4411 ms | **71 %** | 65 ms |
-| `0x80003e8700` | 1265 ms | 20 % | 19 ms |
-| 10 weitere zusammen | 474 ms | 8 % | — |
+| `0x800038be00` | 4314 ms | **71 %** | 66 ms |
+| `0x80003e8700` | 1240 ms | 20 % | 19 ms |
+| 10 weitere zusammen | 505 ms | 8 % | — |
 
 ## Aktives Ziel: `0x800038be00`
 
@@ -93,89 +94,116 @@ allein 1.023-mal. Bei `0x80003e8700` sind es 14,4 %. Der Emitter hat keinen
 Konstanten-Cache.
 
 Das ist ein **Compile-Zeit-Kostenpunkt, kein GPU-Zeit-Kostenpunkt** — der Treiber faltet
-Duplikate trivial. Es erklärt also nichts von den 65 ms, wohl aber einen Teil der
+Duplikate trivial. Es erklärt also nichts von den 66 ms, wohl aber einen Teil der
 `recompile 49,9 s` aus der Sitzung. Nicht mit fps-Erwartung anfassen.
 
 ### Zweiter Shader `0x80003e8700` (20 % GPU-Last, 19 ms)
 
-428 Code-Words, 14 Blöcke, 8 Schleifen → **26.939 SPIR-V-Words** (63x), 876 Blöcke,
-`8x8x1` Threads, wave64, LDS 0. laneCount-Faktor 1,35x.
+428 Code-Words, 230 Instruktionen, 14 Blöcke und **keine einzige Back-Edge** →
+**26.939 SPIR-V-Words** (63x), 876 emittierte Blöcke, `8x8x1` Threads, wave64, LDS 0.
+laneCount-Faktor 1,35x. Pro Invocation mit 9,200 ms/Mio. der teuerste der großen Pässe —
+schleifenfrei.
 
 ## Codegröße erklärt die Kosten nicht
 
-Alle 12 Programme aus der `[gputime]`-Liste liegen als Dump vor und wurden
-nachgerechnet (`ms/Frame` = `ms pro 10 s` / 68 Presents):
+Alle Programme der `[gputime]`-Liste wurden gegen ihre Dumps nachgerechnet. Die
+Expansion ist überall ähnlich groß (21x bis 284x) und läuft den Kosten **nicht** mitlaufend:
 
-| Programm | ms/Frame | Code-Words | SPIR-V | Faktor |
-|---|---|---|---|---|
-| `0x800038be00` | **64,87** | 1288 | 131.454 | 102x |
-| `0x80003e8700` | 18,60 | 428 | 26.939 | 63x |
-| `0x8000269d00` | **2,38** | 4976 | **711.493** | 143x |
-| `0x80003bfe00` | 1,09 | 808 | 84.838 | 105x |
-| `0x80003e6400` | 1,07 | 440 | 74.287 | 169x |
-| `0x80003ed000` | 0,85 | 380 | 26.630 | 70x |
-| `0x80003f3600` | 0,56 | 336 | 23.396 | 70x |
-| `0x7ff6b46cf600` | 0,37 | 60 | 1.275 | 21x |
-| `0x8000405300` | 0,24 | 248 | 21.850 | 88x |
-| `0x80003cd800` | **0,21** | 656 | **186.103** | 284x |
-| `0x8000423300` | 0,12 | 132 | 11.443 | 87x |
-| `0x8000414300` | 0,09 | 180 | 11.977 | 67x |
+- `0x8000269d00` trägt **711.493** SPIR-V-Words — 5,4x so viel wie der Flaschenhals —
+  und kostet 2,38 ms gegen 66,37 ms.
+- `0x80003cd800` trägt **186.103** Words, mehr als der Flaschenhals, und kostet 0,20 ms.
+- `0x80003f3600` trägt 23.396 Words bei **identischer Invocation-Zahl** und kostet 0,55 ms.
 
-`0x8000269d00` hat **5,4x mehr SPIR-V** als der Flaschenhals und kostet **27x weniger**.
-`0x80003cd800` hat 1,4x mehr Code und kostet 309x weniger. Die Expansion von 102x,
-die 15x Block-Zersplitterung und die 34 % Masken-Ops sind also **kein hinreichender
-Grund** für die 65 ms — sonst müssten diese beiden Programme die Liste anführen.
+Die 102x Expansion, die 15x Block-Zersplitterung und die 34 % Masken-Ops sind damit
+**kein hinreichender Grund** für die 66 ms — sonst müssten die beiden größten Module die
+Liste anführen. Codegröße ist als Haupterklärung ausgeschlossen.
 
-**Vorbehalt:** die Invocation-Zahlen der anderen Programme sind ungemessen. Die Tabelle
-widerlegt „Kosten ∝ Codegröße", sie beweist noch nicht, woran es stattdessen liegt.
+## Phase A durch: es sind die Guest-Buffer, nicht die Pixel
 
-## Offen — das entscheidet die Richtung
+`APS5_TRACE_DISPATCH_GEOMETRY=1` lieferte die Grids aller 86 Programme, die Threads pro
+Gruppe kommen aus dem Replay. `ms/Frame` = `ms pro 10 s` / 65 Presents.
 
-1. **Invocations pro Programm.** Ohne sie ist nicht zu trennen, ob `0x800038be00` teuer
-   pro Invocation ist oder einfach als einziges über den vollen 4K-Grid läuft. Das ist
-   die billigste und am stärksten unterscheidende Messung.
-2. **Schleifen-Trip-Counts.** 8 Schleifen, Hauptschleife 21 Blöcke. Datenabhängig und
-   statisch nicht bestimmbar.
-3. **ALU- oder Memory-bound, Occupancy, Registerdruck.** Das Projekt hat kein
-   `VK_KHR_performance_query`, dafür braucht es Nsight.
+| Programm | ms/Frame | Grid | Threads | Invocations | **ms/Mio. Inv** | Buffers | Regionen | Images |
+|---|---|---|---|---|---|---|---|---|
+| `0x8000269d00` | 2,38 | 1x64x36 | 4x4x4 | 147.456 | 16,172 | 24 | 46 | 29 |
+| `0x80003e8700` | 19,08 | 240x135x1 | 8x8x1 | 2.073.600 | 9,200 | 3 | 10 | 2 |
+| `0x80003bfe00` | 1,14 | 60x34x1 | 8x8x1 | 130.560 | 8,720 | — | — | — |
+| `0x800038be00` | **66,37** | 240x135x1 | 16x16x1 | **8.294.400** | **8,002** | **12** | **10** | 1 |
+| `0x80003ed000` | 0,86 | 64x32x1 | 8x8x1 | 131.072 | 6,573 | — | — | — |
+| `0x7ff6b46cf600` | 0,37 | 2040x1x1 | 64x1x1 | 130.560 | 2,828 | — | — | — |
+| `0x80003cd800` | 0,20 | 64x36x1 | 4x4x4 | 147.456 | 1,356 | 3 | 6 | 2 |
+| `0x80003e6400` | 1,05 | 240x135x1 | 8x8x1 | 2.073.600 | 0,505 | 1 | 4 | 3 |
+| `0x80003f3600` | 0,55 | 480x270x1 | 8x8x1 | **8.294.400** | **0,067** | 1 | 3 | 3 |
+| `0x8000405300` | 0,25 | 480x270x1 | 8x8x1 | **8.294.400** | **0,030** | 0 | 3 | 5 |
+| `0x8000423300` | 0,11 | 480x270x1 | 8x8x1 | **8.294.400** | **0,013** | 0 | 3 | 2 |
 
-### Messplan
+(`0x800035d400`: 64 Invocations bei 1x1x1-Grid, 1442 ms/Mio. — Launch-Overhead, kein
+Signal.)
 
-**A — Invocations für alle Programme, ein Lauf, in-project.**
+**Der kontrollierte Vergleich:** vier Programme fahren exakt dieselben 8.294.400
+Invocations, dieselbe wave64, dieselbe Hardware. Drei davon kosten 0,013–0,067 ms pro
+Mio. Invocations, `0x800038be00` kostet **8,002** — ein Faktor **120x bis 600x**.
 
-```
-APS5_PROFILE_GPU=1 APS5_PROFILE_DRAW=1 APS5_TRACE_DISPATCH_GEOMETRY=1 .\app.exe
-```
+Damit ist es **kein Auflösungsproblem**: andere Voll-4K-Pässe sind praktisch gratis.
+Es ist ein Pro-Invocation-Ausreißer.
 
-Die Sonde meldet einmal pro Programm `groups=` und `indirect=`; mit den Threads pro
-Gruppe aus dem Replay ergibt das die Invocations. Daraus `ms pro Mio. Invocations` je
-Programm. Liegt `0x800038be00` dabei im Feld, ist es schlicht der einzige Voll-4K-Pass
-und die Frage heißt Auflösung/HLE. Ist es ein Ausreißer pro Invocation, sitzt das
-Problem im Shader (Trip-Counts, Speicher).
+**Und es sind nicht die Schleifen.** `0x80003e8700` hat **null Back-Edges** (13 Blöcke,
+230 Instruktionen) und kostet pro Invocation mit 9,200 sogar *mehr* als der Flaschenhals.
+Trip-Counts können die gemeinsame Ursache nicht sein.
 
-**B — Wave64-Kosten real messen, ein A/B.**
+**Was übrig bleibt und monoton mitläuft, ist die Zahl der Guest-Buffer:**
+0 Buffer → 0,013 / 0,030 · 1 Buffer → 0,067 / 0,505 · 3 Buffer → 1,356 / 9,200 ·
+12 Buffer → 8,002 · 24 Buffer → 16,172. Images korrelieren nicht (die billigsten Pässe
+haben die meisten).
 
-```
-APS5_PROFILE_GPU=1 APS5_SINGLE_LANE=800038be00 .\app.exe
-```
+### Die V#-Deskriptoren von `0x800038be00`
 
-`HostSubgroupSize` (`Recompiler.cpp:84`) akzeptiert eine Adress-Teilzeichenkette, der
-Schalter trifft also nur dieses Programm und setzt `laneCount` auf 1. Der
-`[gputime]`-Wert gegen den Basislauf gibt die 1,90x Codegröße in Millisekunden.
-Semantik ändert sich (Cross-Lane läuft über Workgroup- statt Subgroup-Scope), das Bild
-also auf Korrektheit prüfen.
+Aus `--mem`, dekodiert (dword1 Bits 29:16 = Stride, dword2 = num_records):
 
-**C — nur falls A und B es nicht klären:** Nsight Graphics GPU Trace / Nsight Compute
-für SM- gegen Memory-Throughput, Occupancy und Stall-Gründe; `sm__inst_executed` pro
-Dispatch geteilt durch die Invocations aus A ergibt die effektiven Trip-Counts.
+| Buffer | Stride | num_records | Größe | Format | geschrieben |
+|---|---|---|---|---|---|
+| 4 | **2 B** | **8.294.400** | 16,6 MB | 11 | ja |
+| 10 | **1 B** | 8.165.312 | 8,2 MB | 5 | ja |
+| 7, 9 | 4 B | 1.036.800 | je 4,1 MB | — | ja |
+| 5, 11 | 4 B | 32.400 | je 130 KB | 60 | ja |
+| 6, 8 | 2 B | 32.400 | je 65 KB | 18 | ja |
+| 0 | 80 B | 1.024 | 82 KB | — | nein |
+| 1 | 256 B | 1.024 | 262 KB | — | nein |
 
-**Methodik für A und B:** `[gputime]` aggregiert über 10-s-Fenster, die Läufe müssen
-also dieselbe Szene zeigen — gleicher Spielstand, Kamera geparkt, mehrere aufeinander
-folgende Fenster vergleichen. Der Shader-Disk-Cache muss in beiden Läufen gleich warm
-sein, sonst verfälschen Recompiles das Bild.
+Buffer 4 hat **genau einen Record pro Invocation** bei 2 Byte Stride; Buffer 10 ebenso
+bei 1 Byte. Sechs der zwölf werden geschrieben.
 
-`[gputime] by program` braucht **`APS5_PROFILE_GPU`** (`Recorder.cpp:1800`);
-`APS5_PROFILE_DRAW` allein liefert nur die Batch-Stempel.
+**Bandbreite ist es nicht:** ~34 MB adressierbar pro Dispatch in 66 ms sind
+**~0,5 GB/s effektiv**, auf einer GPU mit ~960 GB/s. Das Speichersystem ist nahezu
+unbeschäftigt — die Kosten stecken im Overhead *pro Zugriff*, nicht im Volumen.
+
+Dazu passen die gemessenen 34 % Bit-Manipulation im emittierten Code: Sub-Dword-Zugriffe
+(Stride 1 und 2 Byte) auf format-spezialisierte Buffer werden mit Shift/Mask/Select
+nachgebaut.
+
+## Offen — eine Frage, kein Suchfeld
+
+Die verbleibende Unbekannte ist, ob der Pro-Zugriff-Overhead aus **Instruktionszahl**
+oder aus **Latenz/Occupancy** kommt. Das entscheidet zwischen zwei völlig verschiedenen
+Fixes und lässt sich in-project nicht trennen — das Projekt hat kein
+`VK_KHR_performance_query`.
+
+**B — Nsight Compute oder Nsight Graphics GPU Trace auf den Dispatch von
+`0x800038be00`.** Konkrete Frage: SM-Throughput gegen Memory-Throughput, Occupancy,
+und die Stall-Gründe an den Buffer-Load-Stellen. `sm__inst_executed` geteilt durch
+8.294.400 gibt zusätzlich die real ausgeführten Instruktionen pro Invocation.
+
+**C — flankierend, in-project:** `APS5_SINGLE_LANE=800038be00` preist die gemessenen
+1,90x Codegröße in Millisekunden um (`HostSubgroupSize`, `Recompiler.cpp:84`, matcht die
+Adresse als Teilzeichenkette). Semantik ändert sich dabei (Cross-Lane über Workgroup-
+statt Subgroup-Scope), Bild also auf Korrektheit prüfen. Nach dem Befund oben ist davon
+wenig zu erwarten — Codegröße erklärt die Kosten nicht —, aber es ist ein Lauf.
+
+**Methodik:** `[gputime]` aggregiert über 10-s-Fenster, Läufe müssen dieselbe Szene
+zeigen (gleicher Spielstand, Kamera geparkt, mehrere Fenster vergleichen), und der
+Shader-Disk-Cache muss gleich warm sein. `[gputime] by program` braucht
+**`APS5_PROFILE_GPU`** (`Recorder.cpp:1800`); `APS5_PROFILE_DRAW` allein liefert nur die
+Batch-Stempel.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
