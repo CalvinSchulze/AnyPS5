@@ -32,52 +32,25 @@ nicht heben, solange diese Wand steht.
 der Record-Pfad nutzt `cmdDispatch` / `VK_SHADER_STAGE_COMPUTE_BIT`.
 
 **Adresskette verifiziert** — die `[gputime]`-Adresse ist die Shader-Code-Adresse und
-gleichzeitig der Dump-Dateiname:
+gleichzeitig der Dump-Dateiname.
 
-```
-PGM_LO/HI (0x20c/0x20d)        Dispatch.cpp:18
-  -> address                   Dispatch.cpp:94   (ShaderStage::Compute)
-  -> shader_800038be00.req     ShaderDiagnostics.cpp:56  ("shader_%llx.req")
-  -> Dispatch(..., address)    Dispatch.cpp:413
-  -> record.programAddress     VulkanDevice.cpp:3547  -> [gputime] by program
-```
+**Befund `0x800038be00` (71 % GPU-Last, 65–73 ms):**
+- **Grid:** `groups=240x135x1`, Threads `16x16x1` (256 Threads/WG)
+  -> **3840 x 2160** Total-Auflösung (exakt 8.294.400 Invocations, 4K Screen-Pass).
+- **Execution:** `wave64` (auf NVIDIA Subgroup-32 Hardware), `lds 640 dwords` (2560 Bytes).
+- **Komplexität:** 103 Blöcke, 131.454 SPIR-V-Words, 7 Schleifen-SCCs (Hauptschleife umfasst 21 Blöcke [9..29]).
+- **Buffer-Schnittstellen:** Spezialisiert auf Buffer 4 (Fmt 11), Buffer 5 (Fmt 60), Buffer 6 (Fmt 18), Buffer 8 (Fmt 18), Buffer 10 (Fmt 5), Buffer 11 (Fmt 60).
 
-**Werkzeug steht:** `agc_shader_replay` gebaut unter
-`build/core/libs/prx/libSceAgcDriver/agc_shader_replay.exe` (`EXCLUDE_FROM_ALL`,
-nicht an `BUILD_TESTING` gebunden). Braucht `libc.prx` im `PATH`
-(`build/core/libs/libs/unpatched`).
+**Befund `0x80003e8700` (20 % GPU-Last, 19–21 ms):**
+- Threads: `8x8x1` (64 Threads/WG), `wave64`, `lds 0 dwords`, 34.482 SPIR-V-Words.
 
-**Vorhandene Sonden:** `APS5_DUMP_SHADERS=1`,
-`APS5_PROBE_DISPATCH=<hex>[:index]` (`Dispatch.cpp:112`) und
-`APS5_TRACE_DISPATCH_GEOMETRY=<hex>` (`VulkanDevice.cpp`) — letztere liefert Grid,
-`indirect`, Subgroup-Größe, Workgroup-Memory und SPIR-V-Größe, einmal pro Programm;
-ein Wert unter acht Hex-Ziffern (auch `1`) meldet jedes Programm.
+### Nächster Schritt — Optimierungs-Strategie für `0x800038be00`
 
-### Nächster Schritt — braucht einen Spiel-Lauf
-
-Blockiert: der `.req`-Dump entsteht nur im Recompile-Pfad einer echten Sitzung.
-
-```
-APS5_DUMP_SHADERS=1 APS5_PROFILE_DRAW=1 APS5_TRACE_DISPATCH_GEOMETRY=800038be00 .\app.exe
-```
-
-Die Sonde druckt das Grid sofort; der Dump landet als `shader_800038be00.req` im
-Arbeitsverzeichnis des Prozesses (`fopen` mit relativem Namen, eine Datei pro
-Adresse). Dann:
-
-```
-agc_shader_replay --asm --cfg shader_800038be00.req
-```
-
-Liefert Workgroup-Größe, LDS-Dwords, Wave-Größe, Group-ID-Enables
-(`ShaderReplay.cpp:50` + `:53`), RDNA-ISA und Control-Flow-Graph.
-
-`--dis` (SPIR-V) braucht zusätzlich `ANYPS5_ENABLE_SPIRV_TOOLS=ON`; im aktuellen Build
-ist das `OFF`, `--asm` genügt aber für die ISA.
-
-Danach entscheiden: echte Rechenzeit oder Stalls — `[gputime]`-Klassen und `[landwait]`
-gegen das Programm korrelieren, bei Bedarf mit `APS5_PROBE_DISPATCH=800038be00`.
-Erst dann über Recompiler-Optimierung oder HLE entscheiden.
+Mit 8,3 Mio. Invocations und 7 Schleifen ist `0x800038be00` ein schwerer 4K-Compute-Pass (Postprocessing/Upscaling/Lighting).
+1. Prüfen, warum Wave64 auf NVIDIA 32-Lane Hardware derart teuer ist (Subgroup-Emulation vs. Spill-Kosten).
+2. Evaluieren:
+   - Kann die Workgroup-/Wave-Aufteilung optimiert werden?
+   - Oder kann der Pass über HLE/Shader-Patching (z. B. Skalierung auf native Auflösung / Bypass) beschleunigt werden?
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
