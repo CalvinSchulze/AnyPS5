@@ -227,37 +227,68 @@ Written-Shadow-Staging hält also die DCC-Keys kohärent; ohne es wird ein Displ
 mit gemischten Keys präsentiert und der Titel terminiert. Damit ist die Gegenprobe
 nicht gelaufen — und ein Debug-Schalter, der in einen `SIGABRT` führt, ist für sich
 notierenswert.
+## Mechanismus bestätigt: die Arena ist ein Host-Import, BDA bindet in place
 
-## Offen — ab hier reicht Statik nicht mehr
+`APS5_TRACE_HOST_IMPORT=1` zeigt einen einzigen Import über die ganze Gast-Arena:
 
-Gesichert ist: `0x800038be00` ist ein **Pro-Invocation-Ausreißer** (8,002 gegen
-0,013–0,067 ms/Mio. bei identischer Invocation-Zahl), und es ist **nicht** Auflösung,
-**nicht** Codegröße, **nicht** Schleifen, **nicht** wave64, **nicht** Bandbreite und
-**nicht** das Written-Shadow-Fenster. Kein statisch ablesbares Attribut sagt die Kosten
-vorher.
+```
+[gpu] host import of 0x5000000000+0xd5800000 ok (1 live, 3416.0 MiB live, 3416.0 MiB ever)
+```
 
-Was bleibt, ist nur noch von innerhalb der GPU zu beantworten: ausgeführte
-Instruktionen, Speicherlatenz, Occupancy, Zugriffsmuster. Das Projekt hat kein
-`VK_KHR_performance_query`.
+3416 MiB von `0x5000000000` bis `0x50d5800000`, also **System-RAM über PCIe**. Alle
+V#-Basen von `0x800038be00` liegen darin (Buffer 4 bei +151 MiB, Buffer 10 bei +167 MiB).
 
-**Nsight Compute auf den einen Dispatch** (er ist trivial zu finden: längster Dispatch
-im Frame, 71 % der GPU-Zeit). Gebraucht werden SM- gegen Memory-Throughput, Occupancy
-(erreicht gegen theoretisch), die Top-Stall-Gründe, und `sm__inst_executed` geteilt
-durch 8.294.400 — gegen die 30.244 statischen SPIR-V-Instruktionen gerechnet trennt das
-Instruktionszahl von Latenz.
+`VulkanDevice.cpp:954` benennt den Zweck:
 
-**Flankierend, ein Lauf, billig:** `APS5_TRACE_HOST_IMPORT=1` druckt
-`[gpu] host import of 0x<base>+0x<bytes> ok` (`GuestBufferMemory.cpp:637`). Erscheinen
-darin die V#-Basen des Flaschenhalses (Buffer 4 `0x5009771200+0xfd2000`, Buffer 10
-`0x500a762c40`), liegen diese Ranges als Host-Import im System-RAM und jeder Zugriff
-geht über PCIe — die PCIe-Erklärung wäre dann bestätigt, nur eben nicht über den
-Staging-Pfad.
+> *"Guest memory is host memory: importing it lets address-based shaders use it in place
+> instead of copying every registered allocation per draw."*
 
-**Methodik:** `[gputime]` aggregiert über 10-s-Fenster, Läufe müssen dieselbe Szene
-zeigen (gleicher Spielstand, Kamera geparkt, die letzten Fenster vergleichen), und der
-Shader-Disk-Cache muss gleich warm sein. `[gputime] by program` braucht
-**`APS5_PROFILE_GPU`** (`Recorder.cpp:1800`); `APS5_PROFILE_DRAW` allein liefert nur die
-Batch-Stempel.
+Und damit ist auch geklärt, warum das Staging-Fenster wirkungslos war: `0x800038be00`
+deklariert `PhysicalStorageBufferAddresses`, also ist in `stagingEligible` das
+`addressable`-Flag gesetzt und das Staging wird **vor** dem Größenfilter abgewiesen —
+adressierbare Builds lesen den Import in place, weil `AddressRanges` eine Device-Adresse
+braucht. Die Buffer bleiben im Host-RAM, und 8,29 Mio. Invocations greifen dort zu.
+
+### Was damit noch nicht gezeigt ist
+
+Der Import der Arena ist **erwartbar** — so funktioniert Gast-Speicher hier
+grundsätzlich. Dass der Mechanismus vorliegt, ist belegt; dass er die 66 ms *verursacht*,
+noch nicht. Drei Datenpunkte aus der Tabelle oben widersprechen einer reinen
+„in place über PCIe"-Erklärung:
+
+- `0x80003e6400`: BDA, **1** Buffer, 2.073.600 Invocations → **0,505** ms/Mio.
+- `0x80003e8700`: BDA, **3** Buffer, 2.073.600 Invocations → **9,200** ms/Mio.
+- `0x80003cd800`: BDA, **3** Buffer → **1,356** ms/Mio., also 6,8x billiger als
+  `0x80003e8700` bei gleichem Mechanismus und gleicher Buffer-Zahl.
+- `0x8000269d00`: pro Invocation das teuerste (16,172) und nutzt **kein** BDA, bindet
+  also gar nicht adressierbar in place.
+
+Was zählt, ist offenbar die Zahl der **Zugriffe pro Invocation**, nicht die Zahl der
+gebundenen Buffer — und die ist statisch nicht ablesbar. Der Mechanismus ist damit der
+plausibelste Hauptverdächtige, aber als Kausalaussage fehlt der Eingriff.
+
+### Nächster Schritt — Kausalität durch Eingriff, kein Profiler
+
+`APS5_NO_HOST_IMPORT=1` schaltet `VK_EXT_external_memory_host` ab
+(`VulkanDevice.cpp:956`). Adressierbare Builds müssen die Ranges dann **kopieren**
+statt in place zu lesen, der Zugriff läuft also device-local. Fällt `0x800038be00`
+dabei deutlich, ist PCIe-in-place die Ursache; bleibt es flach, ist es das nicht.
+
+Vorsicht bei der Grenze: `APS5_ADDRESS_COPY_MAX_MIB` steht auf **64 MiB**, und ein
+Überschreiten ruft `std::abort()` mit `FATAL: an address-based build copies <n> MiB of
+<k> registered ranges, past 64 MiB` (`GuestBufferMemory.cpp:1445`, `:1857`).
+
+1. **Erst mit Default laufen.** Der Abbruch ist selbst das Messergebnis: die Meldung
+   listet die acht größten kopierten Ranges mit Größe und Grund und sagt damit, wie viel
+   Gast-Speicher ein adressierbarer Build dieses Shaders überhaupt anfasst.
+2. **Dann mit angehobener Grenze**, z. B. `APS5_ADDRESS_COPY_MAX_MIB=4096`, und
+   `[gputime] by program` gegen die Basislinie (4122–4314 ms) vergleichen. Die
+   Kopierkosten tauchen separat auf (`[address]`-Zeile, `guest memory upload`), die
+   fps dürfen also sinken — entscheidend ist allein der Posten `0x800038be00`.
+
+Nsight Compute bleibt die Rückfallebene, ist aber auf dem Messrechner nicht installiert
+und wird durch diesen Eingriff auch nicht gebraucht: er testet die Hypothese direkt,
+statt sie aus Countern zu erschließen.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
