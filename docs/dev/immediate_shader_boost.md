@@ -6,11 +6,10 @@
 ## Aktueller Stand
 
 Messgrundlage: `APS5_PROFILE_DRAW`-Sitzung, 38.441 Frames, ~94 min, **~6,8 fps**
-(68 Presents / 10 s, 148 ms pro Frame).
+(68 Presents / 10 s, 148 ms pro Frame). Hardware: RTX 5080 (Host-Subgroup 32).
 
 Die GPU ist der Engpass, nicht CPU und nicht IO: `batch 8996 ms first to last command`
-pro 10-s-Fenster → **~90 % Wall-Clock-Belegung**. Datei-IO spielt keine Rolle
-(keine IO-Telemetrie in der Sitzung).
+pro 10-s-Fenster → **~90 % Wall-Clock-Belegung**. Datei-IO spielt keine Rolle.
 
 GPU-Zeit ist extrem schief verteilt (6201 ms pro 10 s):
 
@@ -20,37 +19,104 @@ GPU-Zeit ist extrem schief verteilt (6201 ms pro 10 s):
 | `0x80003e8700` | 1265 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 474 ms | 8 % | — |
 
-## Aktives Ziel: `0x800038be00` entlasten
+## Aktives Ziel: `0x800038be00`
 
-65 ms pro Frame in einem einmal pro Frame aufgerufenen Programm. Zwei Programme machen
-92 % der GPU-Last — alles andere ist dagegen Rauschen, und CPU-/IO-Arbeit kann die fps
-nicht heben, solange diese Wand steht.
+### Gast-Shader — klein
 
-### Gesichert
+- **818 RDNA-Instruktionen** in 1288 Code-Words, **102 Blöcke**, **8 Schleifen**
+  (Back-Edges 29→9, 51→46, 58→53, 65→60, 79→75, 85→81, 91→87, 97→93;
+  Hauptschleife `[9..29]`, 21 Blöcke, 164 Instruktionen).
+- Grid `240x135x1` Gruppen x `16x16x1` Threads = **8.294.400 Guest-Threads** (4K-Pass).
+- `wave64`, LDS 640 dwords (2560 B), 2 User-Data-Words, 10 Memory-Regionen.
+- 6 Buffer format-spezialisiert (4→11, 5→60, 6→18, 8→18, 10→5, 11→60), 1 Image-Mode
+  aus 21 aufgelöst.
 
-**Stage: Compute.** `Dispatch.cpp:94` baut die Request mit `ShaderStage::Compute`,
-der Record-Pfad nutzt `cmdDispatch` / `VK_SHADER_STAGE_COMPUTE_BIT`.
+### Erzeugter SPIR-V — 102x so groß
 
-**Adresskette verifiziert** — die `[gputime]`-Adresse ist die Shader-Code-Adresse und
-gleichzeitig der Dump-Dateiname.
+| | gemessen |
+|---|---|
+| Words | **131.449** |
+| Instruktionen | 30.244 |
+| Basisblöcke | **2.623** (Entry-Funktion 2.388 = 96 % des Codes) |
+| Deklarationen / Funktionscode | 16.320 (12,4 %) / 115.129 (87,6 %) |
+| Blockgröße | Median **7 Words**, Mittel 41,9, Max 5.857 |
+| `OpLoopMerge` / `OpSelectionMerge` | 10 / **667** |
 
-**Befund `0x800038be00` (71 % GPU-Last, 65–73 ms):**
-- **Grid:** `groups=240x135x1`, Threads `16x16x1` (256 Threads/WG)
-  -> **3840 x 2160** Total-Auflösung (exakt 8.294.400 Invocations, 4K Screen-Pass).
-- **Execution:** `wave64` (auf NVIDIA Subgroup-32 Hardware), `lds 640 dwords` (2560 Bytes).
-- **Komplexität:** 103 Blöcke, 131.454 SPIR-V-Words, 7 Schleifen-SCCs (Hauptschleife umfasst 21 Blöcke [9..29]).
-- **Buffer-Schnittstellen:** Spezialisiert auf Buffer 4 (Fmt 11), Buffer 5 (Fmt 60), Buffer 6 (Fmt 18), Buffer 8 (Fmt 18), Buffer 10 (Fmt 5), Buffer 11 (Fmt 60).
+**102 Quell-Blöcke → 2.623 emittierte Blöcke.** Der Median-Block hat 7 Words, also
+ein bis zwei Instruktionen: die Kontrollfluss-Struktur ist in Mikroblöcke zersplittert.
 
-**Befund `0x80003e8700` (20 % GPU-Last, 19–21 ms):**
-- Threads: `8x8x1` (64 Threads/WG), `wave64`, `lds 0 dwords`, 34.482 SPIR-V-Words.
+### Wave64 ist real, aber nicht die Hauptursache
 
-### Nächster Schritt — Optimierungs-Strategie für `0x800038be00`
+A/B über `APS5_SINGLE_LANE=all`, das `laneCount` von 2 auf 1 schaltet:
 
-Mit 8,3 Mio. Invocations und 7 Schleifen ist `0x800038be00` ein schwerer 4K-Compute-Pass (Postprocessing/Upscaling/Lighting).
-1. Prüfen, warum Wave64 auf NVIDIA 32-Lane Hardware derart teuer ist (Subgroup-Emulation vs. Spill-Kosten).
-2. Evaluieren:
-   - Kann die Workgroup-/Wave-Aufteilung optimiert werden?
-   - Oder kann der Pass über HLE/Shader-Patching (z. B. Skalierung auf native Auflösung / Bypass) beschleunigt werden?
+| | laneCount=2 (NVIDIA) | laneCount=1 | Faktor |
+|---|---|---|---|
+| Words | 131.449 | 69.258 | **1,90x** |
+| Basisblöcke | 2.623 | 1.569 | 1,67x |
+| `OpSelectionMerge` | 667 | 421 | 1,58x |
+| `OpLoopMerge` | 10 | 10 | 1,00x |
+
+Mechanismus: `SpirvEmitter.cpp:256` setzt `laneCount = 2`, wenn ein wave64-Programm auf
+einem 32-Lane-Host-Subgroup läuft; `SpirvFlowEmitter.cpp:745` emittiert daraufhin jede
+Instruktion zweimal, eine pro Wave-Hälfte (wave-uniforme Werte nur einmal, über
+`WaveUniformValues`). `HostSubgroupSize` (`Recompiler.cpp:84`) liefert dafür
+`target.subgroupSize` = 32.
+
+**Entscheidend:** schon bei `laneCount=1` bleiben 69.258 Words aus 818 Instruktionen —
+**85 SPIR-V-Words pro Guest-Instruktion** und **15,4x Block-Zersplitterung** (102 → 1.569).
+Die Basis-Übersetzung ist der dominierende Faktor, Wave64 legt 1,90x darauf.
+
+### Ein Drittel des Codes ist Lane-Maskierung
+
+| Opcode | Instruktionen | Words | Anteil Words |
+|---|---|---|---|
+| `OpBitwiseAnd` | 3.347 | 16.735 | 12,7 % |
+| `OpSelect` | 2.104 | 12.624 | 9,6 % |
+| `OpLogicalAnd` | 1.307 | 6.535 | 5,0 % |
+| Vergleiche (`INotEqual`, `IEqual`, `ULessThan`) | 2.033 | 10.165 | 7,7 % |
+| Shifts (`ShiftLeft/RightLogical`) | 1.403 | 7.015 | 5,3 % |
+
+**10.194 von 30.244 Instruktionen (34 %)** sind Bit-Extraktion, Prädikation und
+Masken-Verknüpfung. Dazu passen die vielen `condition=execz`-Terminatoren im Quell-CFG:
+RDNA prädiziert jede Vektor-Instruktion über EXEC, und das wird explizit nachgebaut.
+
+### Separater Defekt: keine Konstanten-Deduplikation
+
+| | Instruktionen | distinkt | redundant | Words |
+|---|---|---|---|---|
+| `OpConstant` | 2.389 | 174 | 2.215 | 8.860 |
+| `OpConstantTrue` | 1.002 | 1 | 1.001 | 3.003 |
+| `OpConstantFalse` | 695 | 1 | 694 | 2.082 |
+
+**13.945 Words = 10,6 % des Moduls** sind reine Duplikate; `OpConstant` Typ `%1` Wert `0`
+allein 1.023-mal. Bei `0x80003e8700` sind es 14,4 %. Der Emitter hat keinen
+Konstanten-Cache.
+
+Das ist ein **Compile-Zeit-Kostenpunkt, kein GPU-Zeit-Kostenpunkt** — der Treiber faltet
+Duplikate trivial. Es erklärt also nichts von den 65 ms, wohl aber einen Teil der
+`recompile 49,9 s` aus der Sitzung. Nicht mit fps-Erwartung anfassen.
+
+### Zweiter Shader `0x80003e8700` (20 % GPU-Last, 19 ms)
+
+428 Code-Words, 14 Blöcke, 8 Schleifen → **26.939 SPIR-V-Words** (63x), 876 Blöcke,
+`8x8x1` Threads, wave64, LDS 0. laneCount-Faktor 1,35x.
+
+## Offen — das entscheidet die Richtung
+
+Die statische Analyse belegt schlechte Codegen-Qualität, **beweist aber keine
+Laufzeit-Zuordnung**. 65 ms für einen 4K-Compute-Pass liegen grob eine
+Größenordnung über dem, was so ein Pass nativ kostet. Was fehlt:
+
+1. **Schleifen-Trip-Counts.** 8 Schleifen, Hauptschleife 21 Blöcke. Ob die 65 ms aus
+   Codegröße oder aus Iterationszahl kommen, ist ungemessen — und das ändert die
+   Antwort vollständig.
+2. **ALU- oder Memory-bound?** 10 Memory-Regionen, 34 % Masken-Ops. Ohne diese
+   Trennung ist nicht klar, ob Codegen-Aufräumen überhaupt etwas bringt.
+3. **Occupancy / Registerdruck.** Ein 131k-Words-Modul erzeugt ein großes natives
+   Binary; niedrige Occupancy würde Speicherlatenz nicht mehr verstecken.
+
+Nächster Schritt ist eine Laufzeitmessung (Nsight auf dem laufenden Titel oder
+`[gputime]`-Klassen gegen das Programm), nicht weitere Statik.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
@@ -65,7 +131,7 @@ Mit 8,3 Mio. Invocations und 7 Schleifen ist `0x800038be00` ein schwerer 4K-Comp
 Verdacht: Einträge werden nicht eingefügt oder direkt wieder entfernt. Unverifiziert —
 nicht cachebare Objekte sind eine legitime Erklärung. Treibt die ~960.000 vollen
 Resource-Builds und damit den Großteil von `B images` (581 s) und
-`[guestmem] collect` (466 s / 13,8 M Calls). Billigste potenzielle Einsparung im Log.
+`[guestmem] collect` (466 s / 13,8 M Calls).
 
 Zweiter Miss-Grund: **222.871 Misses aus V#-Wort 0** — Basisadresse von
 Ring-Allocations churnt den Content-Key, obwohl die Ressource äquivalent ist.
@@ -73,6 +139,18 @@ Fix-Richtung: auf Offset-im-Ring statt Absolutadresse keyed.
 
 **`B images` aus dem GPU-Mutex holen** — 581 s serialisiert unter dem globalen
 Mutex. Erst relevant, wenn die GPU entlastet ist.
+
+## Werkzeuge
+
+```
+APS5_DUMP_SHADERS=1 APS5_PROFILE_DRAW=1 APS5_TRACE_DISPATCH_GEOMETRY=800038be00 .\app.exe
+agc_shader_replay [--asm] [--cfg] [--spv] shader_800038be00.req
+APS5_SINGLE_LANE=all agc_shader_replay ...     # laneCount=1 zum Vergleich
+```
+
+`agc_shader_replay` braucht `libc.prx` im `PATH`. `--cfg` gibt pro Block
+`words=` aus — das ist `estimatedSpirvWords`, eine **Heuristik** des Structurizers,
+keine Messung des Ergebnisses; für echte Größen den `--spv`-Dump auswerten.
 
 ## Referenz: Kostenverteilung CPU-Seite
 
