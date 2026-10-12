@@ -68,6 +68,48 @@ bool HasPrefix(const std::string& path, const std::string& prefix) {
            (path.size() == prefix.size() || path[prefix.size()] == '/');
 }
 
+std::optional<std::string> FlipCase(std::string_view name) {
+    std::string flipped(name);
+    bool alphabetic = false;
+    for (auto& character : flipped) {
+        if (character >= 'a' && character <= 'z') { character -= 'a' - 'A'; alphabetic = true; }
+        else if (character >= 'A' && character <= 'Z') { character += 'a' - 'A'; alphabetic = true; }
+    }
+    if (!alphabetic) return std::nullopt;
+    return flipped;
+}
+
+struct CaseFolding {
+    std::mutex mutex;
+    std::map<std::filesystem::path, bool> ignoresCase;
+};
+CaseFolding& Folding() { static CaseFolding folding; return folding; }
+
+bool DirectoryIgnoresCase(const std::filesystem::path& directory) {
+    auto& folding = Folding();
+    {
+        std::lock_guard lock(folding.mutex);
+        const auto known = folding.ignoresCase.find(directory);
+        if (known != folding.ignoresCase.end()) return known->second;
+    }
+    constexpr int probeLimit = 8;
+    std::error_code error;
+    std::optional<bool> ignores;
+    std::filesystem::directory_iterator entry(directory, error), end;
+    for (int probe = 0; !error && entry != end && probe < probeLimit; entry.increment(error), ++probe) {
+        const auto flipped = FlipCase(entry->path().filename().string());
+        if (!flipped) continue;
+        std::error_code compare;
+        const bool same = std::filesystem::equivalent(entry->path(), directory / *flipped, compare);
+        ignores = same && !compare;
+        break;
+    }
+    if (error || !ignores) return false;
+    std::lock_guard lock(folding.mutex);
+    folding.ignoresCase[directory] = *ignores;
+    return *ignores;
+}
+
 std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::filesystem::path& relative) {
     const auto direct = root / relative;
     std::error_code error;
@@ -76,6 +118,10 @@ std::filesystem::path ResolveHostPath(std::filesystem::path root, const std::fil
         const auto candidate = root / part;
         const auto status = std::filesystem::symlink_status(candidate, error);
         if (std::filesystem::exists(status) || (error && error != std::errc::no_such_file_or_directory)) {
+            root = candidate;
+            continue;
+        }
+        if (DirectoryIgnoresCase(root)) {
             root = candidate;
             continue;
         }
@@ -115,7 +161,7 @@ struct WorkingDirectory {
     std::filesystem::path current = root;
 };
 WorkingDirectory& Directories() { static WorkingDirectory state; return state; }
-std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
+std::filesystem::path Resolve(const std::filesystem::path& root, const std::filesystem::path& current, const char* path) {
     std::string text(path);
     for (auto& character : text) if (character == '\\') character = '/';
     std::filesystem::path input(text);
@@ -123,10 +169,10 @@ std::filesystem::path Resolve(WorkingDirectory& state, const char* path) {
     // Preserve the existing ability to pass explicit native drive paths.
     if (input.has_root_name()) return input;
 #endif
-    auto guest = (std::filesystem::path("/") / state.current.lexically_relative(state.root));
+    auto guest = (std::filesystem::path("/") / current.lexically_relative(root));
     guest = (input.is_absolute() ? input : guest / input).lexically_normal();
     if (auto aliased = ResolveAlias(guest.relative_path().generic_string())) return *aliased;
-    return ResolveHostPath(state.root, guest.relative_path()).make_preferred();
+    return ResolveHostPath(root, guest.relative_path()).make_preferred();
 }
 #ifdef _WIN32
 using WriteMark = FILETIME;
@@ -301,8 +347,14 @@ extern "C" void BlockPathAlias_nid_no_patch(const char* guestPrefix) {
 extern "C" std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
     if (!path) { APS5_INVALID_ARG_EX; }
     auto& state = Directories();
-    std::lock_guard lock(state.mutex);
-    return Resolve(state, path);
+    std::filesystem::path root;
+    std::filesystem::path current;
+    {
+        std::lock_guard lock(state.mutex);
+        root = state.root;
+        current = state.current;
+    }
+    return Resolve(root, current, path);
 }
 
 extern "C" int APS5_VABI chdir_nid_postfix(const char* path) {
@@ -312,7 +364,7 @@ extern "C" int APS5_VABI chdir_nid_postfix(const char* path) {
         auto& state = Directories();
         std::lock_guard lock(state.mutex);
         std::error_code error;
-        const auto resolved = std::filesystem::canonical(Resolve(state, path), error);
+        const auto resolved = std::filesystem::canonical(Resolve(state.root, state.current, path), error);
         if (error) { errno = DirectoryFailure(error); return -1; }
         if (!std::filesystem::is_directory(resolved, error)) {
             errno = error ? DirectoryFailure(error) : 20; return -1;
