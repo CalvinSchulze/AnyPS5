@@ -65,7 +65,11 @@ IrU1 TranslationContext::readMaskValid(const RdnaOperand& operand) {
     }
     switch (operand.kind) {
         case RdnaOperandKind::Null:
-        case RdnaOperandKind::PopsExitingWaveId: return IrU1(ir.ConstantBool(true));
+        case RdnaOperandKind::PopsExitingWaveId:
+        case RdnaOperandKind::SharedBase:
+        case RdnaOperandKind::SharedLimit:
+        case RdnaOperandKind::PrivateBase:
+        case RdnaOperandKind::PrivateLimit: return IrU1(ir.ConstantBool(true));
         case RdnaOperandKind::ScalarRegister: return IrU1(ir.GetScalarMaskTag(static_cast<ScalarReg>(operand.reg)));
         case RdnaOperandKind::ExecLo:
         case RdnaOperandKind::ExecHi:

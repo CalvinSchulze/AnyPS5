@@ -35,6 +35,12 @@ bool bdaTraceEnabled() {
 }
 constexpr unsigned bdaTraceLimit = 8;
 
+bool tableTraceEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACE_BINDLESS") != nullptr;
+    return enabled;
+}
+#define APS5_TRACE_TABLE(...) do { if (tableTraceEnabled()) { std::fprintf(stderr, __VA_ARGS__); std::fflush(stderr); } } while (0)
+
 std::string formatHex32(std::uint32_t value) {
     static constexpr char digits[] = "0123456789abcdef";
     std::string hex(8u, '0');
@@ -131,22 +137,32 @@ public:
             }
         }
         for (const auto& plan : m_indirectImages) {
-            plan.handle->ReplaceArgument(0, plan.key);
-            for (std::uint32_t dword = 0; dword < 4u; dword++) {
-                plan.handle->ReplaceArgument(dword + 1u, plan.roots[dword]);
+            for (IrValue* h : plan.handles) {
+                h->ReplaceArgument(0, plan.key);
+                for (std::uint32_t dword = 0; dword < 4u; dword++) {
+                    h->ReplaceArgument(dword + 1u, plan.roots[dword]);
+                }
+                for (std::uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
+                    h->ReplaceArgument(dword, plan.key);
+                }
             }
-            for (std::uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
-                plan.handle->ReplaceArgument(dword, plan.key);
-            }
-            for (const auto index : plan.memory) {
-                m_program.Resources().memoryInfo[index].planningOnly = true;
+            for (std::uint32_t dword = 0; dword < 8u; ++dword) {
+                const auto index = plan.memory[dword];
+                const auto* read = plan.reads[dword];
+                if (index != std::numeric_limits<std::uint32_t>::max() && index < m_program.Resources().memoryInfo.size() && read != nullptr) {
+                    if (read->Uses().empty()) {
+                        m_program.Resources().memoryInfo[index].planningOnly = true;
+                    }
+                }
             }
         }
         std::erase_if(m_program.Metadata().dynamicReads, [&](IrValue* value) {
             const IrValue* inst = value->Resolve();
-            return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
-                return std::ranges::find(plan.reads, inst) != plan.reads.end();
-            });
+            const auto flags = inst->Flags<MemoryFlags>();
+            if (flags.index < m_program.Resources().memoryInfo.size() && m_program.Resources().memoryInfo[flags.index].planningOnly) {
+                return true;
+            }
+            return false;
         });
         m_program.Resources().descriptorSources = std::move(m_sources);
         m_program.Resources().info = std::move(m_info);
@@ -168,10 +184,16 @@ private:
 
     struct IndirectImagePlan {
         IrValue* handle = nullptr;
+        std::vector<IrValue*> handles;
         std::uint32_t source = 0;
         IrValue* key = nullptr;
         std::array<IrValue*, 8> roots {};
-        std::array<std::uint32_t, 8> memory {};
+        std::array<std::uint32_t, 8> memory {
+            std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max(),
+            std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max(),
+            std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max(),
+            std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()
+        };
         std::array<const IrValue*, 8> reads {};
     };
 
@@ -263,15 +285,27 @@ private:
     }
 
     const MemoryInfo* ScalarReadMemory(const IrValue& read, std::uint32_t& index) const {
-        if (read.Opcode() != IrOpcode::ReadConstBuffer || read.ArgumentCount() != 2u) {
+        const auto op = read.Opcode();
+        if ((op != IrOpcode::ReadConstBuffer || read.ArgumentCount() != 2u) &&
+            (op != IrOpcode::LoadAddressU32 || read.ArgumentCount() != 4u)) {
+            APS5_TRACE_TABLE("[table-image] ScalarReadMemory null: op=%u, argCount=%zu\n",
+                static_cast<unsigned>(op), read.ArgumentCount());
             return nullptr;
         }
         index = read.Flags<MemoryFlags>().index;
         if (index >= m_program.Resources().memoryInfo.size()) {
+            APS5_TRACE_TABLE("[table-image] ScalarReadMemory null: index %u >= size %zu\n", index, m_program.Resources().memoryInfo.size());
             return nullptr;
         }
         const auto& memory = m_program.Resources().memoryInfo[index];
-        return memory.kind == ResourceKind::ScalarBuffer && memory.dataBits == 32u && memory.dataDwords == 1u ? &memory : nullptr;
+        const bool validKind = (op == IrOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarBuffer) ||
+                               (op == IrOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarAddress);
+        if (!(validKind && memory.dataBits == 32u && memory.dataDwords == 1u)) {
+            APS5_TRACE_TABLE("[table-image] ScalarReadMemory null: op=%u, validKind=%d, kind=%u, bits=%u, dwords=%u\n",
+                static_cast<unsigned>(op), validKind, static_cast<unsigned>(memory.kind), memory.dataBits, memory.dataDwords);
+            return nullptr;
+        }
+        return &memory;
     }
 
     bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
@@ -282,6 +316,8 @@ private:
                     continue;
                 }
                 if (inst->Flags<MemoryFlags>().index == index) {
+                    APS5_TRACE_TABLE("[table-image] MemoryIndexBelongsTo conflict: inst %p op=%u vs owner %p op=%u, index=%u\n",
+                        inst, static_cast<unsigned>(op), &owner, static_cast<unsigned>(owner.Opcode()), index);
                     return false;
                 }
             }
@@ -290,10 +326,11 @@ private:
     }
 
     bool MakeRuntimeBufferSource(const IrValue& handle, std::uint32_t& source, DescriptorSource& descriptor) {
-        if (handle.Opcode() != IrOpcode::GetBufferResource) {
+        if (handle.Opcode() != IrOpcode::GetBufferResource && handle.Opcode() != IrOpcode::GetAddressResource) {
             return false;
         }
-        MakeSource(handle, 4u, false, false, descriptor);
+        const std::uint32_t width = handle.Opcode() == IrOpcode::GetAddressResource ? 2u : 4u;
+        MakeSource(handle, width, false, false, descriptor);
         std::uint32_t badDword = 0;
         if (!ValidateSource(descriptor, badDword)) {
             return false;
@@ -305,17 +342,35 @@ private:
     bool MatchMaterialOffset(IrValue* value, IrValue*& selector, std::uint32_t& stride, std::uint32_t& offset) const {
         value = value->Resolve();
         offset = 0;
-        IrValue* candidate = value;
-        if (candidate->Opcode() == IrOpcode::IAdd32 && candidate->ArgumentCount() == 2u) {
-            std::uint32_t immediate = 0;
-            if (immediateU32(candidate->Argument(0), immediate)) {
-                value = candidate->Argument(1)->Resolve();
-            } else if (immediateU32(candidate->Argument(1), immediate)) {
-                value = candidate->Argument(0)->Resolve();
-            } else {
-                return false;
+        while (true) {
+            while ((value->Opcode() == IrOpcode::ReadFirstLane || value->Opcode() == IrOpcode::ReadLane) && value->ArgumentCount() >= 1u) {
+                value = value->Argument(0)->Resolve();
             }
-            offset = immediate;
+            if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
+                std::uint32_t immediate = 0;
+                if (immediateU32(value->Argument(0), immediate)) {
+                    offset += immediate;
+                    value = value->Argument(1)->Resolve();
+                    continue;
+                } else if (immediateU32(value->Argument(1), immediate)) {
+                    offset += immediate;
+                    value = value->Argument(0)->Resolve();
+                    continue;
+                }
+            }
+            break;
+        }
+        while ((value->Opcode() == IrOpcode::ReadFirstLane || value->Opcode() == IrOpcode::ReadLane) && value->ArgumentCount() >= 1u) {
+            value = value->Argument(0)->Resolve();
+        }
+        if (value->Opcode() == IrOpcode::ShiftLeftLogical32 && value->ArgumentCount() == 2u) {
+            std::uint32_t shift = 0;
+            if (immediateU32(value->Argument(1), shift) && shift < 32u) {
+                stride = 1u << shift;
+                selector = value->Argument(0)->Resolve();
+                return stride != 0u;
+            }
+            return false;
         }
         IrValue* multiply = value;
         if (multiply->Opcode() != IrOpcode::IMul32 || multiply->ArgumentCount() != 2u) {
@@ -328,36 +383,55 @@ private:
         } else {
             return false;
         }
-        return stride != 0u && selector->Opcode() == IrOpcode::ReadFirstLane;
+        return stride != 0u;
     }
 
-    // The table entry offset `key * 32` (a shift or a multiply), optionally plus an immediate.
-    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset) {
+    // The table entry offset `key * stride` (a shift or a multiply), optionally plus an immediate.
+    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset, std::uint32_t& entryStride) {
         value = value->Resolve();
+        APS5_TRACE_TABLE("[table-image] MatchTableOffset enter: %s\n", describeValueChain(value, 6u).c_str());
         entryOffset = 0;
-        if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
-            std::uint32_t immediate = 0;
-            if (immediateU32(value->Argument(0), immediate)) {
-                value = value->Argument(1)->Resolve();
-            } else if (immediateU32(value->Argument(1), immediate)) {
+        entryStride = 32u;
+        while (true) {
+            while ((value->Opcode() == IrOpcode::ReadFirstLane || value->Opcode() == IrOpcode::ReadLane) && value->ArgumentCount() >= 1u) {
                 value = value->Argument(0)->Resolve();
-            } else {
-                return false;
             }
-            entryOffset = immediate;
+            if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
+                std::uint32_t immediate = 0;
+                if (immediateU32(value->Argument(0), immediate)) {
+                    entryOffset += immediate;
+                    value = value->Argument(1)->Resolve();
+                    continue;
+                } else if (immediateU32(value->Argument(1), immediate)) {
+                    entryOffset += immediate;
+                    value = value->Argument(0)->Resolve();
+                    continue;
+                }
+            }
+            break;
+        }
+        while ((value->Opcode() == IrOpcode::ReadFirstLane || value->Opcode() == IrOpcode::ReadLane) && value->ArgumentCount() >= 1u) {
+            value = value->Argument(0)->Resolve();
         }
         if (value->ArgumentCount() != 2u) {
+            APS5_TRACE_TABLE("[table-image] MatchTableOffset argCount != 2: op=%u, count=%zu\n",
+                static_cast<unsigned>(value->Opcode()), value->ArgumentCount());
             return false;
         }
         std::uint32_t scale = 0;
         if (value->Opcode() == IrOpcode::ShiftLeftLogical32) {
-            if (!immediateU32(value->Argument(1), scale) || scale != 5u) {
+            if (!immediateU32(value->Argument(1), scale) || scale < 4u || scale > 31u) {
+                APS5_TRACE_TABLE("[table-image] MatchTableOffset ShiftLeft scale=%u\n", scale);
                 return false;
             }
             key = value->Argument(0)->Resolve();
+            entryStride = 1u << scale;
+            APS5_TRACE_TABLE("[table-image] MatchTableOffset ShiftLeft ok, stride=%u\n", entryStride);
             return true;
         }
         if (value->Opcode() != IrOpcode::IMul32) {
+            APS5_TRACE_TABLE("[table-image] MatchTableOffset not IMul32: op=%u\n",
+                static_cast<unsigned>(value->Opcode()));
             return false;
         }
         if (immediateU32(value->Argument(1), scale)) {
@@ -365,9 +439,16 @@ private:
         } else if (immediateU32(value->Argument(0), scale)) {
             key = value->Argument(1)->Resolve();
         } else {
+            APS5_TRACE_TABLE("[table-image] MatchTableOffset IMul32 neither immediate\n");
             return false;
         }
-        return scale == 32u;
+        APS5_TRACE_TABLE("[table-image] MatchTableOffset IMul32 scale=%u\n", scale);
+        if (scale >= 16u && (scale % 4u == 0u)) {
+            entryStride = scale;
+            return true;
+        }
+        APS5_TRACE_TABLE("[table-image] MatchTableOffset IMul32 bad scale=%u\n", scale);
+        return false;
     }
 
     // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
@@ -375,56 +456,110 @@ private:
     // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
     bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
+            APS5_TRACE_TABLE("[table-image] TryMakeTableImage rejected handle op=%u, argCount=%zu\n",
+                static_cast<unsigned>(handle.Opcode()), handle.ArgumentCount());
             return false;
         }
+
+        const bool is128Bit = std::all_of(handle.Arguments().begin() + 4, handle.Arguments().end(), [](const IrValue* arg) {
+            const IrValue* val = arg->Resolve();
+            return val->HasImmediate() && val->Type() == IrType::U32 && val->ImmediateU32() == 0u;
+        });
+        const std::uint32_t tableDwords = is128Bit ? 4u : 8u;
+        APS5_TRACE_TABLE("[table-image] TryMakeTableImage called on handle %p (op=%u, args=%zu, is128Bit=%d, tableDwords=%u)\n",
+            &handle, static_cast<unsigned>(handle.Opcode()), handle.ArgumentCount(), is128Bit, tableDwords);
 
         std::array<IrValue*, 8> heapReads {};
         IrValue* heapHandle = nullptr;
         IrValue* heapOffset = nullptr;
         std::uint32_t immediateOffset = 0;
-        for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
+        for (std::uint32_t dword = 0; dword < tableDwords; dword++) {
             heapReads[dword] = handle.Argument(dword)->Resolve();
+            APS5_TRACE_TABLE("[table-image] handle %p dword %u: read=%p op=%u args=%zu\n",
+                &handle, dword, heapReads[dword], static_cast<unsigned>(heapReads[dword]->Opcode()), heapReads[dword]->ArgumentCount());
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
-            if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
+            if (memory == nullptr) {
+                APS5_TRACE_TABLE("[table-image] dword %u ScalarReadMemory returned null (read op=%u)\n",
+                    dword, static_cast<unsigned>(heapReads[dword]->Opcode()));
+                return false;
+            }
+            if (!MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
+                APS5_TRACE_TABLE("[table-image] dword %u MemoryIndexBelongsTo returned false (memIndex=%u)\n",
+                    dword, memoryIndex);
                 return false;
             }
             if (dword == 0u) {
                 immediateOffset = memory->offset;
             } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
+                APS5_TRACE_TABLE("[table-image] dword %u bad offset: expected %u, got %u\n",
+                    dword, immediateOffset + dword * 4u, memory->offset);
                 return false;
             }
             IrValue* currentHandle = heapReads[dword]->Argument(0)->Resolve();
-            if (heapHandle != nullptr && currentHandle != heapHandle) {
+            if (heapHandle != nullptr && currentHandle != heapHandle &&
+                !EquivalentValue(m_program.Resources(), heapHandle, currentHandle)) {
+                APS5_TRACE_TABLE("[table-image] dword %u handle mismatch: heapHandle=%p, currentHandle=%p\n",
+                    dword, heapHandle, currentHandle);
                 return false;
             }
             heapHandle = currentHandle;
             if (dword == 0u) {
                 heapOffset = heapReads[dword]->Argument(1)->Resolve();
             } else if (!EquivalentValue(m_program.Resources(), heapOffset, heapReads[dword]->Argument(1))) {
+                APS5_TRACE_TABLE("[table-image] dword %u EquivalentValue returned false\n", dword);
                 return false;
             }
             plan.memory[dword] = memoryIndex;
             plan.reads[dword] = heapReads[dword];
         }
+        for (std::uint32_t dword = tableDwords; dword < 8u; dword++) {
+            heapReads[dword] = handle.Argument(dword)->Resolve();
+        }
 
         IrValue* key = nullptr;
         std::uint32_t entryOffset = 0;
-        if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32) {
+        std::uint32_t entryStride = 32u;
+        if (!MatchTableOffset(heapOffset, key, entryOffset, entryStride) || key->Type() != IrType::U32) {
+            APS5_TRACE_TABLE("[table-image] TryMakeTableImage rejected offset: %s (op=%u, key type=%u)\n",
+                describeValueChain(heapOffset, 6u).c_str(),
+                static_cast<unsigned>(heapOffset->Opcode()), key ? static_cast<unsigned>(key->Type()) : 999u);
+            return false;
+        }
+        if (entryStride < tableDwords * sizeof(std::uint32_t)) {
+            APS5_TRACE_TABLE("[table-image] TryMakeTableImage rejected: entryStride %u < %u bytes\n",
+                entryStride, tableDwords * 4u);
             return false;
         }
         entryOffset += immediateOffset;
 
-        const std::array<const IrValue*, 1> imageUsers {&handle};
-        for (const auto* read : heapReads) {
-            if (!usesOnly(*read, imageUsers)) {
+        for (std::uint32_t dword = 0; dword < tableDwords; ++dword) {
+            const auto* read = heapReads[dword];
+            if (read->Uses().empty()) {
+                APS5_TRACE_TABLE("[table-image] TryMakeTableImage rejected read: empty uses\n");
                 return false;
+            }
+            const bool onlyImageUsers = std::ranges::all_of(read->Uses(), [&](const IrValue* user) {
+                return user == &handle || (user->Opcode() == IrOpcode::GetImageResource && user->ArgumentCount() == 8u);
+            });
+            if (!onlyImageUsers) {
+                APS5_TRACE_TABLE("[table-image] TryMakeTableImage note: read has non-image users (count=%zu), planningOnly will remain false for this read\n",
+                    read->Uses().size());
+            }
+            for (IrValue* user : read->Uses()) {
+                if (user->Opcode() == IrOpcode::GetImageResource && user->ArgumentCount() == 8u) {
+                    if (std::ranges::find(plan.handles, user) == plan.handles.end()) {
+                        plan.handles.push_back(user);
+                    }
+                }
             }
         }
 
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
         if (!MakeRuntimeBufferSource(*heapHandle, heapSourceIndex, heapSource)) {
+            APS5_TRACE_TABLE("[table-image] TryMakeTableImage rejected heap source: op=%u\n",
+                static_cast<unsigned>(heapHandle->Opcode()));
             return false;
         }
 
@@ -432,16 +567,21 @@ private:
         table.heapSource = heapSourceIndex;
         table.materialSource = heapSourceIndex;
         table.entryOffset = entryOffset;
+        table.entryStride = entryStride;
         DescriptorSource materialSource = heapSource;
         std::uint32_t materialMemoryIndex = 0;
-        const MemoryInfo* materialMemory = ScalarReadMemory(*key, materialMemoryIndex);
-        if (materialMemory != nullptr && MemoryIndexBelongsTo(materialMemoryIndex, *key)) {
+        const IrValue* materialKey = key->Resolve();
+        while ((materialKey->Opcode() == IrOpcode::ReadFirstLane || materialKey->Opcode() == IrOpcode::ReadLane) && materialKey->ArgumentCount() >= 1u) {
+            materialKey = materialKey->Argument(0)->Resolve();
+        }
+        const MemoryInfo* materialMemory = ScalarReadMemory(*materialKey, materialMemoryIndex);
+        if (materialMemory != nullptr && MemoryIndexBelongsTo(materialMemoryIndex, *materialKey)) {
             IrValue* selector = nullptr;
             std::uint32_t selectorStride = 0;
             std::uint32_t selectorOffset = 0;
             DescriptorSource candidateSource;
             std::uint32_t candidateIndex = 0;
-            if (MatchMaterialOffset(key->Argument(1), selector, selectorStride, selectorOffset) && MakeRuntimeBufferSource(*key->Argument(0)->Resolve(), candidateIndex, candidateSource)) {
+            if (MatchMaterialOffset(materialKey->Argument(1), selector, selectorStride, selectorOffset) && MakeRuntimeBufferSource(*materialKey->Argument(0)->Resolve(), candidateIndex, candidateSource)) {
                 table.hasMaterial = true;
                 table.materialSource = candidateIndex;
                 table.selectorStride = selectorStride;
@@ -452,28 +592,55 @@ private:
 
         DescriptorSource imageSource;
         imageSource.dwordCount = 8u;
-        std::copy(heapSource.dwords.begin(), heapSource.dwords.begin() + 4u, imageSource.dwords.begin());
-        std::copy(materialSource.dwords.begin(), materialSource.dwords.begin() + 4u, imageSource.dwords.begin() + 4u);
+        for (std::uint32_t d = 0; d < 4u; ++d) {
+            imageSource.dwords[d] = d < heapSource.dwordCount ? heapSource.dwords[d] : &m_builder.Constant(0u);
+        }
+        for (std::uint32_t d = 0; d < 4u; ++d) {
+            imageSource.dwords[d + 4u] = d < materialSource.dwordCount ? materialSource.dwords[d] : &m_builder.Constant(0u);
+        }
         imageSource.indirectImage = table;
 
         plan.handle = &handle;
+        if (std::ranges::find(plan.handles, &handle) == plan.handles.end()) {
+            plan.handles.push_back(&handle);
+        }
         plan.source = InternSource(imageSource);
         plan.key = key;
         plan.roots = imageSource.dwords;
         return true;
     }
 
-    const IndirectImagePlan* FindIndirectImage(const IrValue& handle) const {
+    IndirectImagePlan* FindIndirectImage(const IrValue& handle) {
         const auto found = std::ranges::find_if(m_indirectImages, [&](const IndirectImagePlan& plan) {
-            return plan.handle == &handle;
+            if (plan.handle == &handle || std::ranges::find(plan.handles, &handle) != plan.handles.end()) {
+                return true;
+            }
+            if (plan.handle != nullptr && plan.handle->Opcode() == handle.Opcode() && plan.handle->ArgumentCount() == handle.ArgumentCount()) {
+                bool match = true;
+                for (size_t i = 0; i < handle.ArgumentCount(); ++i) {
+                    if (!EquivalentValue(m_program.Resources(), plan.handle->Argument(i), handle.Argument(i))) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return true;
+                }
+            }
+            return false;
         });
         return found == m_indirectImages.end() ? nullptr : &*found;
     }
 
+    const IndirectImagePlan* FindIndirectImage(const IrValue& handle) const {
+        return const_cast<Tracker*>(this)->FindIndirectImage(handle);
+    }
+
     bool IsIndirectPlanningMemory(std::uint32_t index) const {
-        return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
-            return std::ranges::find(plan.memory, index) != plan.memory.end();
-        });
+        if (index == std::numeric_limits<std::uint32_t>::max() || index >= m_program.Resources().memoryInfo.size()) {
+            return false;
+        }
+        return m_program.Resources().memoryInfo[index].planningOnly;
     }
 
     static constexpr std::uint32_t phiSearchDepth = 8u;
@@ -905,9 +1072,19 @@ private:
                     continue;
                 }
                 IrValue* handle = inst->Argument(0)->Resolve();
-                const IndirectImagePlan* planned = FindIndirectImage(*handle);
+                IndirectImagePlan* planned = FindIndirectImage(*handle);
+                APS5_TRACE_TABLE("[plan-image] inst op=%u (access=%u, class=%u), handle %p op=%u args=%zu, planned=%d\n",
+                    static_cast<unsigned>(inst->Opcode()), static_cast<unsigned>(imageInfo.access),
+                    static_cast<unsigned>(imageInfo.resourceClass), handle,
+                    static_cast<unsigned>(handle->Opcode()), handle->ArgumentCount(), planned != nullptr);
+                if (planned != nullptr) {
+                    if (std::ranges::find(planned->handles, handle) == planned->handles.end()) {
+                        planned->handles.push_back(handle);
+                    }
+                    continue;
+                }
                 IndirectImagePlan plan;
-                if (planned == nullptr && !TryMakeTableImage(*handle, plan)) {
+                if (!TryMakeTableImage(*handle, plan)) {
                     continue;
                 }
                 // A store through a table would mark every bound slot pending write-back.
@@ -915,9 +1092,7 @@ private:
                     ResourceMaterializer::CountBindlessRejection(BindlessRejection::Storage);
                     fail("bindless storage image tables are unsupported");
                 }
-                if (planned == nullptr) {
-                    m_indirectImages.push_back(std::move(plan));
-                }
+                m_indirectImages.push_back(std::move(plan));
             }
         }
     }
@@ -931,16 +1106,29 @@ private:
         MakeSource(*handle, width, sampler, sampleAdjust, descriptor);
         std::uint32_t badDword = 0;
         if (expected == IrOpcode::GetImageResource) {
+            APS5_TRACE_TABLE("[tracker] GetHandle GetImageResource handle=%p dwordCount=%u\n",
+                handle, descriptor.dwordCount);
             for (; badDword < descriptor.dwordCount; badDword++) {
                 const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
                 if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
+                    APS5_TRACE_TABLE("[tracker] GetImageResource dword %u is ReadConstBuffer: %s\n",
+                        badDword, describeValueChain(descriptor.dwords[badDword], 8u).c_str());
                     fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
                 }
             }
             badDword = 0;
         }
         if (!ValidateSource(descriptor, badDword)) {
-            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            if (expected == IrOpcode::GetSamplerResource) {
+                APS5_TRACE_TABLE("[tracker] GetSamplerResource dword %u is not a valid runtime value (%s), using default linear clamp sampler\n",
+                    badDword, describeValueChain(descriptor.dwords[badDword], 4u).c_str());
+                descriptor.dwords[0] = &m_builder.Constant(0x00000092u);
+                descriptor.dwords[1] = &m_builder.Constant(0x00fff000u);
+                descriptor.dwords[2] = &m_builder.Constant(0x08500000u);
+                descriptor.dwords[3] = &m_builder.Constant(0x00000000u);
+            } else {
+                fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            }
         }
         source = InternSource(descriptor);
     }
@@ -1197,10 +1385,15 @@ private:
             fail("image operation has invalid resource kind");
         }
         handle = inst.Argument(0)->Resolve();
-        const IndirectImagePlan* indirect = FindIndirectImage(*handle);
+        IndirectImagePlan* indirect = FindIndirectImage(*handle);
         if (indirect != nullptr) {
             source = indirect->source;
+            if (std::ranges::find(indirect->handles, handle) == indirect->handles.end()) {
+                indirect->handles.push_back(handle);
+            }
         } else {
+            APS5_TRACE_TABLE("[collect-image] handle %p op=%u not indirect (indirectImages count=%zu), calling GetHandle\n",
+                handle, static_cast<unsigned>(handle->Opcode()), m_indirectImages.size());
             GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
         }
         resource = AddImage(source, memory, op, flags.pc);

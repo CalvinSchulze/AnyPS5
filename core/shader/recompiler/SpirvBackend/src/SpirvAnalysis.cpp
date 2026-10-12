@@ -302,6 +302,11 @@ std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const
 
 SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
     SpirvRequirements requirements {};
+    if (program.Resources().stage == IrShaderStage::Compute) {
+        requirements.subgroupLocalInvocationId = true;
+        requirements.subgroupShuffle = true;
+        requirements.subgroupBallot = true;
+    }
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
             const auto addressAccess = AddressOpcodeInfoOf(inst->Opcode()).access;
@@ -333,8 +338,10 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 }
                 const auto& memory = program.Resources().memoryInfo.at(memoryIndex);
                 requirements.coherentBuffers = requirements.coherentBuffers || (memory.coherent && !memory.gpuDescriptor);
-                if (!memory.planningOnly) {
-                    requirements.subgroupLocalInvocationId = requirements.subgroupLocalInvocationId || program.Resources().stage == IrShaderStage::Compute;
+                if (!memory.planningOnly && program.Resources().stage == IrShaderStage::Compute) {
+                    requirements.subgroupLocalInvocationId = true;
+                    requirements.subgroupShuffle = true;
+                    requirements.subgroupBallot = true;
                 }
             }
             const auto sharedAccess = SharedAccessOf(inst->Opcode());

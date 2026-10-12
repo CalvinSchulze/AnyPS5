@@ -3,6 +3,7 @@
 
 #include "IntermediateRepresentation/IrBlock.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
+#include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "IntermediateRepresentation/IrMetadata/ControlFlowInfo.hpp"
 #include "IntermediateRepresentation/IrMetadata/DescriptorBinding.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourceInfo.hpp"
@@ -75,6 +76,7 @@ struct IrResourcePlan {
     bool resourceTrackingComplete = false;
     ShaderInfo info;
     UniformFillPlan uniformFill;
+    std::vector<IrBufferFormat> runtimeBufferFormats;
 };
 
 }

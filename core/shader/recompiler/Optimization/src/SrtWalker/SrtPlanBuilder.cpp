@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
 namespace ShaderRecompiler::Detail {
 
@@ -43,49 +45,97 @@ void PlanBuilder::Run() {
     PatchReads();
 }
 
-void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {
-    IrValue* value = raw->Resolve();
-    if (value->Opcode() == IrOpcode::Void) {
+void PlanBuilder::Collect(IrValue* initialRaw, std::uint32_t usePc) {
+    if (initialRaw == nullptr) {
         return;
     }
-    IrValue* inst = value;
-    const auto cycle = std::find(_visiting.begin(), _visiting.end(), inst);
-    if (cycle != _visiting.end()) {
-        const auto containsPhi = std::any_of(cycle, _visiting.end(), [](IrValue* candidate) { return candidate->Opcode() == IrOpcode::Phi; });
-        if (containsPhi) {
-            return;
+    IrValue* root = initialRaw->Resolve();
+    if (root->Opcode() == IrOpcode::Void) {
+        return;
+    }
+    if (_visited.contains(root)) {
+        return;
+    }
+
+    struct Frame {
+        IrValue* inst;
+        std::size_t nextArg;
+    };
+
+    std::vector<Frame> stack;
+    std::unordered_map<IrValue*, std::size_t> inVisiting;
+
+    stack.push_back({root, 0});
+    inVisiting[root] = 0;
+
+    while (!stack.empty()) {
+        auto& frame = stack.back();
+        IrValue* inst = frame.inst;
+
+        if (frame.nextArg < inst->ArgumentCount()) {
+            IrValue* argRaw = inst->Argument(frame.nextArg++);
+            if (argRaw == nullptr) {
+                continue;
+            }
+            IrValue* child = argRaw->Resolve();
+            if (child->Opcode() == IrOpcode::Void) {
+                continue;
+            }
+
+            auto visitIt = inVisiting.find(child);
+            if (visitIt != inVisiting.end()) {
+                const auto cycleStart = visitIt->second;
+                bool containsPhi = false;
+                for (std::size_t i = cycleStart; i < stack.size(); ++i) {
+                    if (stack[i].inst->Opcode() == IrOpcode::Phi) {
+                        containsPhi = true;
+                        break;
+                    }
+                }
+                if (containsPhi) {
+                    continue;
+                }
+                Fail(_program.Resources(), usePc, "cyclic typed planning value " + std::string(IrOpcodeName(child->Opcode())) + " without a phi");
+            }
+
+            if (_visited.contains(child)) {
+                continue;
+            }
+
+            inVisiting[child] = stack.size();
+            stack.push_back({child, 0});
+        } else {
+            IrValue* processedInst = inst;
+            inVisiting.erase(processedInst);
+            stack.pop_back();
+            _visited.insert(processedInst);
+
+            if (!IsRawRead(_program.Resources(), *processedInst)) {
+                continue;
+            }
+            IrValue* offset = processedInst->Argument(1)->Resolve();
+            const auto foldable = offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(processedInst);
+            if (!foldable) {
+                if (std::find(_program.Metadata().dynamicReads.begin(), _program.Metadata().dynamicReads.end(), processedInst) == _program.Metadata().dynamicReads.end()) {
+                    _program.Metadata().dynamicReads.push_back(processedInst);
+                }
+                continue;
+            }
+            bool foundEquivalent = false;
+            for (std::uint32_t slot = 0; slot < _program.Resources().srtReads.size(); slot++) {
+                if (EquivalentValue(_program.Resources(), processedInst, _program.Resources().srtReads[slot].value)) {
+                    _patches.push_back({processedInst, slot, false});
+                    foundEquivalent = true;
+                    break;
+                }
+            }
+            if (!foundEquivalent) {
+                const auto slot = static_cast<std::uint32_t>(_program.Resources().srtReads.size());
+                _program.Resources().srtReads.push_back({processedInst, slot});
+                _patches.push_back({processedInst, slot, true});
+            }
         }
-        Fail(_program.Resources(), usePc, "cyclic typed planning value " + std::string(IrOpcodeName(inst->Opcode())) + " without a phi");
     }
-    if (std::find(_visited.begin(), _visited.end(), inst) != _visited.end()) {
-        return;
-    }
-    _visiting.push_back(inst);
-    for (std::size_t index = 0; index < inst->ArgumentCount(); index++) {
-        Collect(inst->Argument(index), usePc);
-    }
-    _visiting.pop_back();
-    _visited.push_back(inst);
-    if (!IsRawRead(_program.Resources(), *inst)) {
-        return;
-    }
-    IrValue* offset = inst->Argument(1)->Resolve();
-    const auto foldable = offset->HasImmediate() && offset->Type() == IrType::U32 && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst);
-    if (!foldable) {
-        if (std::find(_program.Metadata().dynamicReads.begin(), _program.Metadata().dynamicReads.end(), value) == _program.Metadata().dynamicReads.end()) {
-            _program.Metadata().dynamicReads.push_back(value);
-        }
-        return;
-    }
-    for (std::uint32_t slot = 0; slot < _program.Resources().srtReads.size(); slot++) {
-        if (EquivalentValue(_program.Resources(), value, _program.Resources().srtReads[slot].value)) {
-            _patches.push_back({inst, slot, false});
-            return;
-        }
-    }
-    const auto slot = static_cast<std::uint32_t>(_program.Resources().srtReads.size());
-    _program.Resources().srtReads.push_back({value, slot});
-    _patches.push_back({inst, slot, true});
 }
 
 void PlanBuilder::PatchReads() {

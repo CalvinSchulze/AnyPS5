@@ -258,13 +258,25 @@ std::uint32_t AtomicUpdateTyped(SpirvEmitterState& state, std::uint32_t pointer,
     EmitLabel(state, cont);
     state.module.AddFunction(spv::OpBranch, header);
     EmitLabel(state, merge);
-    state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+    // Note: OpAtomicCompareExchange already guarantees atomic read-modify-write.
+    // The device-scope OpMemoryBarrier previously here was causing massive pipeline stalls on every subword store.
     return observed;
 }
 
 template<typename TFunction>
 std::uint32_t AtomicUpdate(SpirvEmitterState& state, std::uint32_t pointer, ResourceKind kind, TFunction&& function) {
     return AtomicUpdateTyped(state, pointer, kind, TypeU32(state), std::forward<TFunction>(function));
+}
+
+inline void AtomicMaskedStore(SpirvEmitterState& state, std::uint32_t pointer, ResourceKind kind, std::uint32_t mask, std::uint32_t value) {
+    const auto u32 = TypeU32(state);
+    const auto scope = ConstantU32(state, kind == ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice);
+    const auto semantics = ConstantU32(state, spv::MemorySemanticsMaskNone);
+    const auto notMask = Unary(state, spv::OpNot, u32, mask);
+    const auto dummyAnd = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAtomicAnd, u32, dummyAnd, pointer, scope, semantics, notMask);
+    const auto dummyOr = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAtomicOr, u32, dummyOr, pointer, scope, semantics, value);
 }
 
 }

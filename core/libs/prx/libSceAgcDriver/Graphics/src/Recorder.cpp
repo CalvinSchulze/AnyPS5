@@ -242,6 +242,13 @@ bool Recorder::InCompletion() {
 
 namespace {
 
+// APS5_NO_HOOK_SYNC=1: the flush hook's pending-write GPU timeline wait is skipped,
+// eliminating massive CPU stalls on speculative batch write overlaps.
+bool HookPendingWriteSyncEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_HOOK_SYNC") == nullptr;
+    return enabled;
+}
+
 // APS5_NO_HOOK_COMPLETION_GUARD=1: the flush hook records the accessing worker's queued labels
 // even from inside a completion action, as before (see FlushForAccess).
 bool HookCompletionGuard() {
@@ -1015,7 +1022,8 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             record();
         }
     }
-    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
+    const auto site = GuestMemory::CurrentReadSite();
+    if (site != GuestMemory::ReadSite::TextureCompare && HookPendingWriteSyncEnabled() && (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes))) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1030,7 +1038,6 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // A reader takes every shadowed unit of the range; a store only the units it covers partly
     // (its own stamp makes the others stale). Inside a completion action a store has no publish
     // recorded: the batch is not waited for, and the copy would land over the store later.
-    const auto site = GuestMemory::CurrentReadSite();
     const auto scope = site != GuestMemory::ReadSite::Store ? PublishScope::Whole : completionDepth != 0 ? PublishScope::None : PublishScope::PartialUnits;
     bool published = false;
     // The classification is made before the store (the store changes what it measures); profile only.
@@ -1051,6 +1058,9 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
     }
     if (stored || published) {
+        if (!HookPendingWriteSyncEnabled() || GuestMemory::IsPresenterThread()) {
+            return;
+        }
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
         // targets the batch holding them (the open one: SyncThrough submits it) and runs with the
         // mutex released when this acquisition is the outermost; a nested hook waits locked through
@@ -3148,6 +3158,11 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
 }
 
 void Recorder::Sync() {
+    if (GuestMemory::IsPresenterThread()) {
+        announcedSource = 4;
+        announcedSite = nullptr;
+        return;
+    }
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
@@ -3165,6 +3180,11 @@ void Recorder::Sync() {
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
+    if (GuestMemory::IsPresenterThread() || !HookPendingWriteSyncEnabled()) {
+        announcedSource = 4;
+        announcedSite = nullptr;
+        return;
+    }
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::

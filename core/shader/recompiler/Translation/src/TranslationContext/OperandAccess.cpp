@@ -428,7 +428,11 @@ IrU32 TranslationContext::readRawU32(const RdnaOperand& operand) {
         case RdnaOperandKind::IntegerInlineConstant:
         case RdnaOperandKind::FloatInlineConstant: return IrU32(ir.Constant(operand.value));
         case RdnaOperandKind::Null:
-        case RdnaOperandKind::PopsExitingWaveId: return IrU32(ir.Constant(0u));
+        case RdnaOperandKind::PopsExitingWaveId:
+        case RdnaOperandKind::SharedBase:
+        case RdnaOperandKind::SharedLimit:
+        case RdnaOperandKind::PrivateBase:
+        case RdnaOperandKind::PrivateLimit: return IrU32(ir.Constant(0u));
         case RdnaOperandKind::ScalarRegister: return IrU32(ir.GetScalarReg(static_cast<ScalarReg>(operand.reg)));
         case RdnaOperandKind::VectorRegister: return IrU32(ir.GetVectorReg(static_cast<VectorReg>(operand.reg)));
         case RdnaOperandKind::VccLo: return IrU32(ir.GetVccLo());

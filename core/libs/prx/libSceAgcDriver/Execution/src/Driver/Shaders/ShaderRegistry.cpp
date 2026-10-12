@@ -203,8 +203,69 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     Shader registered;
     std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
-    used.user_data = registered.user_data;
-    return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0;
+
+    if (used.file_header != registered.file_header ||
+        used.version != registered.version ||
+        used.type != registered.type ||
+        used.shader_size != registered.shader_size ||
+        used.embedded_constant_buffer_size_dqw != registered.embedded_constant_buffer_size_dqw ||
+        used.target != registered.target ||
+        used.num_input_semantics != registered.num_input_semantics ||
+        used.scratch_size_dw_per_thread != registered.scratch_size_dw_per_thread ||
+        used.num_output_semantics != registered.num_output_semantics ||
+        used.special_sizes_bytes != registered.special_sizes_bytes ||
+        used.num_cx_registers != registered.num_cx_registers ||
+        used.num_sh_registers != registered.num_sh_registers) {
+        APS5_LOG_ERR("SameHeader mismatch on scalar fields for code 0x%llx: used target=%u, reg target=%u, used sh_regs=%u, reg sh_regs=%u",
+            static_cast<unsigned long long>(snapshot.codeAddress), used.target, registered.target, used.num_sh_registers, registered.num_sh_registers);
+        return false;
+    }
+
+    if (reinterpret_cast<std::uintptr_t>(used.code) != snapshot.codeAddress) {
+        APS5_LOG_ERR("SameHeader mismatch on code pointer: used=%p, snapshot=0x%llx",
+            used.code, static_cast<unsigned long long>(snapshot.codeAddress));
+        return false;
+    }
+
+    const auto checkArray = [&](const void* usedPtr, const void* regPtr, std::size_t elemSize, std::size_t count) -> bool {
+        if (count == 0) return true;
+        if (usedPtr == regPtr) return true;
+        if (usedPtr == nullptr || regPtr == nullptr) return false;
+        const auto usedAddr = reinterpret_cast<std::uintptr_t>(usedPtr);
+        const auto regAddr = reinterpret_cast<std::uintptr_t>(regPtr);
+        const auto shaderAddr = reinterpret_cast<std::uintptr_t>(shader);
+        if (usedAddr - shaderAddr == regAddr - snapshot.headerAddress) return true;
+        GuestMemory::CheckRange(usedPtr, count * elemSize, 1);
+        if (regAddr >= snapshot.headerAddress && regAddr + count * elemSize <= snapshot.headerAddress + snapshot.header.size()) {
+            const auto offset = regAddr - snapshot.headerAddress;
+            return std::memcmp(usedPtr, snapshot.header.data() + offset, count * elemSize) == 0;
+        }
+        GuestMemory::CheckRange(regPtr, count * elemSize, 1);
+        return std::memcmp(usedPtr, regPtr, count * elemSize) == 0;
+    };
+
+    if (!checkArray(used.sh_registers, registered.sh_registers, sizeof(ShaderRegister), used.num_sh_registers)) {
+        APS5_LOG_ERR("SameHeader mismatch on sh_registers for code 0x%llx", static_cast<unsigned long long>(snapshot.codeAddress));
+        return false;
+    }
+    if (!checkArray(used.cx_registers, registered.cx_registers, sizeof(ShaderRegister), used.num_cx_registers)) {
+        APS5_LOG_ERR("SameHeader mismatch on cx_registers for code 0x%llx", static_cast<unsigned long long>(snapshot.codeAddress));
+        return false;
+    }
+    if (!checkArray(used.specials, registered.specials, sizeof(ShaderSpecialRegs), (registered.specials != nullptr || used.specials != nullptr) ? 1u : 0u)) {
+        APS5_LOG_ERR("SameHeader mismatch on specials for code 0x%llx", static_cast<unsigned long long>(snapshot.codeAddress));
+        return false;
+    }
+    if (!checkArray(used.input_semantics, registered.input_semantics, sizeof(ShaderSemantic), used.num_input_semantics)) {
+        APS5_LOG_ERR("SameHeader mismatch on input_semantics for code 0x%llx", static_cast<unsigned long long>(snapshot.codeAddress));
+        return false;
+    }
+    if (!checkArray(used.output_semantics, registered.output_semantics, sizeof(ShaderSemantic), used.num_output_semantics)) {
+        APS5_LOG_ERR("SameHeader mismatch on output_semantics for code 0x%llx", static_cast<unsigned long long>(snapshot.codeAddress));
+        return false;
+    }
+
+    return true;
 }
 
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
@@ -422,7 +483,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         throw std::runtime_error("AGC driver: unsupported registered shader type " + std::to_string(snapshot.type));
     }
     const auto defer = [&](const char* reason) {
-        APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration (%s); preparing it when it is used", static_cast<unsigned long long>(snapshot.codeAddress), reason);
+        APS5_LOG_OUT_DEBUG("Shader 0x%llx could not be prepared at registration (%s); preparing it when it is used", static_cast<unsigned long long>(snapshot.codeAddress), reason);
         *deferred = true;
         return std::unique_ptr<RegisteredPreparation>{};
     };

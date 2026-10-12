@@ -1341,7 +1341,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
-        swapchain.minImageCount = surface.minImageCount;
+        const std::uint32_t desiredImages = surface.minImageCount + 1u;
+        swapchain.minImageCount = (surface.maxImageCount > 0 && desiredImages > surface.maxImageCount) ? surface.maxImageCount : desiredImages;
         swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
         swapchain.imageExtent = state->extent;
@@ -1350,7 +1351,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        std::uint32_t modeCount = 0;
+        auto getModes = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR");
+        check(getModes(selected, state->surface, &modeCount, nullptr), "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        std::vector<VkPresentModeKHR> modes(modeCount);
+        check(getModes(selected, state->surface, &modeCount, modes.data()), "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        const bool immediateMode = std::getenv("APS5_IMMEDIATE_PRESENT") != nullptr;
+        VkPresentModeKHR preferredMode = VK_PRESENT_MODE_FIFO_KHR;
+        if (immediateMode && std::ranges::find(modes, VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end()) {
+            preferredMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        } else if (std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) != modes.end()) {
+            preferredMode = VK_PRESENT_MODE_MAILBOX_KHR;
+        }
+        swapchain.presentMode = preferredMode;
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -1551,7 +1564,8 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
-    if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
+    const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
+    if (!state->recorder || bytes == 0 || (uniform ? (bytes % 4 != 0 || address % 4 != 0) : (bytes % 16 != 0 || address % 16 != 0))) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
@@ -1638,7 +1652,6 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     using CommandClass = Graphics::Recorder::CommandClass;
     // A queued DCC key store over the range must land before the fill.
     recorder.FlushKeyStoresOverlapping(address, bytes);
-    const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
     const std::array<std::uint32_t, 4> patternWords{pattern[0], pattern[1], pattern[2], pattern[3]};
     std::shared_ptr<Graphics::DeviceBuffer> patternBuffer;
     if (!uniform && !chainInPlace) {
@@ -2141,6 +2154,9 @@ Graphics::DccKeys ResidentKeys(const Graphics::StorageTexture& resident) {
 }
 
 bool ResidentServesDisplay(const Graphics::StorageTexture& resident, const DisplayBuffer& buffer) {
+    if (buffer.dccAddress == 0 || buffer.dccAddress == resident.Descriptor().dccAddress) {
+        return true;
+    }
     const auto keys = DisplayBufferKeys(buffer);
     if (keys == Graphics::DccKeys::ClearRegister) {
         char message[320];
@@ -3529,6 +3545,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (record.programAddress == 0x800038be00) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            std::fprintf(stderr, "[dispatch 0x800038be00] groups=%ux%ux%u indirect=%s\n",
+                record.x, record.y, record.z, argumentImport != nullptr ? "yes" : "no");
+        }
+    }
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
     recorder.EndGpuTiming(gpuTiming);

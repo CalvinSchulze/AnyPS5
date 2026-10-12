@@ -164,6 +164,27 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     LibcAwaitExit_nid_postfix();
 }
 
+int APS5_VABI sceVideoOutGetOutputStatusWithVrr(int handle, void* status) try {
+    if (status == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+    }
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    if (cfg == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
+    }
+    std::unique_lock lock(cfg->mutex);
+    cfg->Check();
+    std::memset(status, 0, 64);
+    auto* s = static_cast<VideoOutOutputStatus*>(status);
+    s->resolution = (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
+    s->dynamicRange = 1;
+    s->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
+    s->flags = 0;
+    return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
 int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatus* status) try {
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");

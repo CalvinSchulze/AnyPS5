@@ -94,9 +94,7 @@ void StoreMisalignedBits(SpirvValueEmitContext& ctx, const MemoryResourceAccess&
     const auto merge = [&](std::uint32_t element, spv::Op direction, std::uint32_t amount) {
         const auto partMask = Binary(state, direction, TypeU32(state), mask, ConstantU32(state, amount));
         const auto partValue = Binary(state, direction, TypeU32(state), value, ConstantU32(state, amount));
-        AtomicUpdate(state, EmitMemoryElementPointer(state, resource, element), resource.kind, [&](std::uint32_t old) {
-            return Binary(state, spv::OpBitwiseOr, TypeU32(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), old, Unary(state, spv::OpNot, TypeU32(state), partMask)), partValue);
-        });
+        AtomicMaskedStore(state, EmitMemoryElementPointer(state, resource, element), resource.kind, partMask, partValue);
     };
     merge(index, spv::OpShiftLeftLogical, shift);
     merge(EmitAddU32(state, index, ConstantU32(state, 1u)), spv::OpShiftRightLogical, 32u - shift);
@@ -241,7 +239,7 @@ void StoreSubwordInBounds(SpirvValueEmitContext& ctx, const MemoryInfo& mem, con
             state.module.AddFunction(spv::OpStore, pointer, merge(old));
         }
     } else {
-        AtomicUpdate(state, pointer, mem.kind, merge);
+        AtomicMaskedStore(state, pointer, mem.kind, mask, value);
     }
 }
 

@@ -1565,7 +1565,17 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto& memory = ctx.Memory(inst);
     const auto& base = ImageResourceOf(state, memory);
-    const auto modes = ResourceMaterializer::RuntimeImageModes(base);
+    const auto& infoModes = state.program.Info().runtimeImageModes;
+    const auto modes = (memory.resource < infoModes.size() && !infoModes[memory.resource].empty())
+        ? infoModes[memory.resource]
+        : ResourceMaterializer::RuntimeImageModes(base);
+    if (state.program.Resources().stage == IrShaderStage::Compute) {
+        std::fprintf(stderr, "[EmitImage 0x%llx] op=%s, mem.res=%u, infoModes.sz=%zu, modes.sz=%zu (empty=%d), indRoot=%u\n",
+            static_cast<unsigned long long>(state.program.Resources().shaderHash),
+            IrOpcodeName(inst.Opcode()), memory.resource, infoModes.size(), modes.size(),
+            memory.resource < infoModes.size() ? infoModes[memory.resource].empty() : -1,
+            base.indirectRoot);
+    }
     state.runtimeImageMetadata = ConstantU32(state, memory.resource);
     const auto table = TableSlot(ctx, inst, memory, base);
     if (table.slot != 0u) {

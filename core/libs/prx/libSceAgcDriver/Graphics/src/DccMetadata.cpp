@@ -429,8 +429,11 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
         }
         PublishShadow(metaAddress, count, PublishScope::Whole, PublishReason::Keys);
         if (auto* recorder = Recorder::Active()) {
-            Recorder::CountSync(2);
-            recorder->Sync();
+            static const bool noHookSync = std::getenv("APS5_NO_HOOK_SYNC") != nullptr;
+            if (!GuestMemory::IsPresenterThread() && !noHookSync) {
+                Recorder::CountSync(2);
+                recorder->Sync();
+            }
         }
     }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
@@ -462,6 +465,11 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
+            static const bool noHookSync = std::getenv("APS5_NO_HOOK_SYNC") != nullptr;
+            if (GuestMemory::IsPresenterThread() || noHookSync) {
+                bool memoized = false;
+                return readDccKeys(metaAddress, count, memoized);
+            }
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
@@ -682,6 +690,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    if (GuestMemory::IsPresenterThread()) return DccKeys::Uncompressed;
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;

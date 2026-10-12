@@ -112,8 +112,9 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = false;
             }
         }
+        static const bool forceFlipWait = std::getenv("APS5_WAIT_FLIP_FENCE") != nullptr;
         if (trailing) {
-            waitedMs += presenting->FinishPresent();
+            waitedMs += (inFlight != 0 && !forceFlipWait) ? presenting->RetirePresents(inFlight) : presenting->FinishPresent();
             timing.Mark("render_fence_wait");
         }
         if (submitted) {

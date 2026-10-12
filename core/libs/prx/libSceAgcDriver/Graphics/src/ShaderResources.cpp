@@ -4,6 +4,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <atomic>
@@ -346,7 +347,8 @@ bool MetadataMoved(const StorageTexture& image, const GuestTextureResource& reso
 bool SampledFromStorageEligible(const Context& context, std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_SAMPLED_FROM_STORAGE") != nullptr;
     if (disabled || IsBlockCompressed(format) || !StorageFormatAvailable(context, format)) return false;
-    return HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
+    if (HostImportCovers(context, address, static_cast<std::size_t>(guestBytes))) return true;
+    return HostImportFor(context, address, static_cast<std::size_t>(guestBytes)) != nullptr;
 }
 
 bool SampledFromStorageEligible(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -751,9 +753,10 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
     return surface;
 }
 
-// `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    if (DepthSurfaceAt(viewed.baseAddress)) {
+    const auto vkFormat = ResolveTextureFormat(viewed.format);
+    const bool isDepth = vkFormat == VK_FORMAT_D16_UNORM || vkFormat == VK_FORMAT_X8_D24_UNORM_PACK32 || vkFormat == VK_FORMAT_D32_SFLOAT || vkFormat == VK_FORMAT_D16_UNORM_S8_UINT || vkFormat == VK_FORMAT_D24_UNORM_S8_UINT || vkFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    if (isDepth && DepthSurfaceAt(viewed.baseAddress)) {
         char text[112];
         std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented", static_cast<unsigned long long>(viewed.baseAddress));
         throw std::runtime_error(text);

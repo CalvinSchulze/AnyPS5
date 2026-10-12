@@ -203,9 +203,7 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
             masked = Binary(state, spv::OpShiftLeftLogical, u32, masked, subwordShift);
         }
         const auto update = [&](std::uint32_t word, std::uint32_t wordMask, std::uint32_t replacement) {
-            AtomicUpdate(state, EmitMemoryElementPointer(state, access, word), access.kind, [&](std::uint32_t old) {
-                return EmitOrU32(state, Binary(state, spv::OpBitwiseAnd, u32, old, Unary(state, spv::OpNot, u32, wordMask)), replacement);
-            });
+            AtomicMaskedStore(state, EmitMemoryElementPointer(state, access, word), access.kind, wordMask, replacement);
         };
         if (bits == 32u) {
             EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), [&] {
@@ -214,6 +212,124 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
                 else state.module.AddFunction(spv::OpStore, pointer, value);
             });
         }
+        const bool isCompute = state.program.Resources().stage == IrShaderStage::Compute;
+        const bool canSubgroup = isCompute && state.subgroupLocalInvocationIdVariable != 0 &&
+            std::ranges::find(state.supportedCapabilities, spv::CapabilityGroupNonUniformShuffle) != state.supportedCapabilities.end() &&
+            std::ranges::find(state.supportedCapabilities, spv::CapabilityGroupNonUniformBallot) != state.supportedCapabilities.end();
+
+        if (canSubgroup && bits == 16u) {
+            state.requirements.subgroupBallot = true;
+            state.requirements.subgroupShuffle = true;
+            const auto hostLane = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u32, hostLane, state.subgroupLocalInvocationIdVariable);
+            const auto isEven = equal(state, EmitAndConstant(state, hostLane, 1u), ConstantU32(state, 0u));
+            const auto partnerLane = Binary(state, spv::OpBitwiseXor, u32, hostLane, ConstantU32(state, 1u));
+
+            const auto activeBallot = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), activeBallot, ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+            const auto ballotWord = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, ballotWord, activeBallot, 0u);
+            const auto partnerBit = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1u), partnerLane);
+            const auto partnerActive = nonzero(state, Binary(state, spv::OpBitwiseAnd, u32, ballotWord, partnerBit));
+
+            const auto partnerAddr = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformShuffle, u32, partnerAddr, ConstantU32(state, spv::ScopeSubgroup), address, partnerLane);
+            const auto partnerVal = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformShuffle, u32, partnerVal, ConstantU32(state, spv::ScopeSubgroup), value, partnerLane);
+
+            const auto evenAligned = equal(state, EmitAndConstant(state, address, 3u), ConstantU32(state, 0u));
+            const auto addrMatches = equal(state, partnerAddr, EmitAddU32(state, address, ConstantU32(state, 2u)));
+            const auto canPack = both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), both(state, partnerActive, both(state, evenAligned, addrMatches)));
+
+            const auto leaderPacked = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), leaderPacked, ConstantU32(state, spv::ScopeSubgroup), canPack, partnerLane);
+
+            const auto packed = Select(state, TypeBool(state), isEven, canPack, leaderPacked);
+
+            EmitIfCondition(state, both(state, packed, isEven), [&] {
+                const auto low16 = EmitAndConstant(state, value, 0xffffu);
+                const auto high16 = Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, partnerVal, 0xffffu), ConstantU32(state, 16u));
+                const auto dword = EmitOrU32(state, low16, high16);
+                const auto pointer = EmitMemoryElementPointer(state, access, index);
+                if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, pointer, dword, access.memoryAccess);
+                else state.module.AddFunction(spv::OpStore, pointer, dword);
+            });
+
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), packed), [&] {
+                const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, misalignment, ConstantU32(state, 3u));
+                update(index, Binary(state, spv::OpShiftLeftLogical, u32, mask, shift), Binary(state, spv::OpShiftLeftLogical, u32, masked, shift));
+                EmitIfCondition(state, unaligned, [&] {
+                    const auto remaining = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
+                    update(next, Binary(state, spv::OpShiftRightLogical, u32, mask, remaining), Binary(state, spv::OpShiftRightLogical, u32, masked, remaining));
+                });
+            });
+            return;
+        }
+
+        if (canSubgroup && bits == 8u) {
+            state.requirements.subgroupBallot = true;
+            state.requirements.subgroupShuffle = true;
+            const auto hostLane = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u32, hostLane, state.subgroupLocalInvocationIdVariable);
+            const auto laneInQuad = EmitAndConstant(state, hostLane, 3u);
+            const auto isLeader = equal(state, laneInQuad, ConstantU32(state, 0u));
+            const auto leaderLane = Binary(state, spv::OpBitwiseAnd, u32, hostLane, ConstantU32(state, ~3u));
+            const auto lane1 = EmitAddU32(state, leaderLane, ConstantU32(state, 1u));
+            const auto lane2 = EmitAddU32(state, leaderLane, ConstantU32(state, 2u));
+            const auto lane3 = EmitAddU32(state, leaderLane, ConstantU32(state, 3u));
+
+            const auto activeBallot = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), activeBallot, ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+            const auto ballotWord = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, ballotWord, activeBallot, 0u);
+            const auto quadMask = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 0x0fu), leaderLane);
+            const auto all4Active = equal(state, Binary(state, spv::OpBitwiseAnd, u32, ballotWord, quadMask), quadMask);
+
+            const auto shuffleU32 = [&](std::uint32_t val, std::uint32_t srcLane) {
+                const auto res = state.module.AllocateId();
+                state.module.AddFunction(spv::OpGroupNonUniformShuffle, u32, res, ConstantU32(state, spv::ScopeSubgroup), val, srcLane);
+                return res;
+            };
+            const auto addr1 = shuffleU32(address, lane1);
+            const auto addr2 = shuffleU32(address, lane2);
+            const auto addr3 = shuffleU32(address, lane3);
+            const auto val1 = shuffleU32(value, lane1);
+            const auto val2 = shuffleU32(value, lane2);
+            const auto val3 = shuffleU32(value, lane3);
+
+            const auto leaderAligned = equal(state, EmitAndConstant(state, address, 3u), ConstantU32(state, 0u));
+            const auto m1 = equal(state, addr1, EmitAddU32(state, address, ConstantU32(state, 1u)));
+            const auto m2 = equal(state, addr2, EmitAddU32(state, address, ConstantU32(state, 2u)));
+            const auto m3 = equal(state, addr3, EmitAddU32(state, address, ConstantU32(state, 3u)));
+            const auto canPack4 = both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), both(state, all4Active, both(state, leaderAligned, both(state, m1, both(state, m2, m3)))));
+
+            const auto quadPacked = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), quadPacked, ConstantU32(state, spv::ScopeSubgroup), canPack4, leaderLane);
+
+            const auto packed = Select(state, TypeBool(state), isLeader, canPack4, quadPacked);
+
+            EmitIfCondition(state, both(state, packed, isLeader), [&] {
+                const auto b0 = EmitAndConstant(state, value, 0xffu);
+                const auto b1 = Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, val1, 0xffu), ConstantU32(state, 8u));
+                const auto b2 = Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, val2, 0xffu), ConstantU32(state, 16u));
+                const auto b3 = Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, val3, 0xffu), ConstantU32(state, 24u));
+                const auto dword = EmitOrU32(state, EmitOrU32(state, b0, b1), EmitOrU32(state, b2, b3));
+                const auto pointer = EmitMemoryElementPointer(state, access, index);
+                if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, pointer, dword, access.memoryAccess);
+                else state.module.AddFunction(spv::OpStore, pointer, dword);
+            });
+
+            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), packed), [&] {
+                const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, misalignment, ConstantU32(state, 3u));
+                update(index, Binary(state, spv::OpShiftLeftLogical, u32, mask, shift), Binary(state, spv::OpShiftLeftLogical, u32, masked, shift));
+                EmitIfCondition(state, unaligned, [&] {
+                    const auto remaining = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
+                    update(next, Binary(state, spv::OpShiftRightLogical, u32, mask, remaining), Binary(state, spv::OpShiftRightLogical, u32, masked, remaining));
+                });
+            });
+            return;
+        }
+
         EmitIfCondition(state, bits == 32u ? unaligned : ConstantBool(state, true), [&] {
             const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, misalignment, ConstantU32(state, 3u));
             update(index, Binary(state, spv::OpShiftLeftLogical, u32, mask, shift), Binary(state, spv::OpShiftLeftLogical, u32, masked, shift));
@@ -263,6 +379,9 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
         selectors[output] = memory.typed ? ConstantU32(state, output < info.componentCount ? 4u + output : 0u) : field(state, resource.word3, output * 3u, 3u);
         selected[output] = Binary(state, spv::OpUMod, u32, Binary(state, spv::OpISub, u32, selectors[output], ConstantU32(state, 4u)), ConstantU32(state, info.componentCount));
     }
+    const bool packToDword = info.packedBitfield || info.byteSize == 4u;
+    const bool packToHalf = !packToDword && info.byteSize == 2u;
+    const bool packMulti = packToDword || packToHalf;
     std::array<std::uint32_t, 4> required{};
     for (std::uint32_t component = 0; component < info.componentCount; ++component) {
         required[component] = ConstantBool(state, store);
@@ -272,7 +391,7 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
                 required[component] = Binary(state, spv::OpLogicalOr, TypeBool(state), required[component], both(state, fromMemory, equal(state, selected[output], ConstantU32(state, component))));
             }
         }
-        addresses[component] = address(context, instruction, resource, GetFormatComponentByteOffset(info, component), info.packedBitfield ? 4u : info.componentBits[component] / 8u);
+        addresses[component] = address(context, instruction, resource, packMulti ? 0u : GetFormatComponentByteOffset(info, component), packToDword ? 4u : packToHalf ? 2u : info.componentBits[component] / 8u);
         inBounds = both(state, inBounds, Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), required[component]), addresses[component].inBounds));
     }
     if (store) {
@@ -281,26 +400,27 @@ std::uint32_t formatted(SpirvValueEmitContext& context, const IrValue& instructi
             auto packed = ConstantU32(state, 0u);
             for (std::uint32_t component = 0; component < info.componentCount; ++component) {
                 const auto encoded = component >= components ? ConstantU32(state, 0u) : memory.d16 ? EmitD16StoreComponent(state, info, component, values[component]) : EmitFormatStoreComponent(state, info, component, values[component]);
-                if (info.packedBitfield) {
+                if (packMulti) {
                     packed = EmitOrU32(state, packed, Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, encoded, (1u << info.componentBits[component]) - 1u), ConstantU32(state, info.componentBitOffset[component])));
                 } else {
                     writeBuffer(context, instruction, addresses[component].guest, encoded, info.componentBits[component]);
                 }
             }
-            if (info.packedBitfield) writeBuffer(context, instruction, addresses[0].guest, packed);
+            if (packToDword) writeBuffer(context, instruction, addresses[0].guest, packed, 32u);
+            else if (packToHalf) writeBuffer(context, instruction, addresses[0].guest, packed, 16u);
         });
         return ConstantU32(state, 0u);
     }
     for (std::uint32_t component = 0; component < info.componentCount; ++component) {
         values[component] = EmitValueOrZeroIfCondition(state, both(state, inBounds, required[component]), [&] {
             const auto bits = info.componentBits[component];
-            auto raw = readBuffer(context, instruction, addresses[component].guest, info.packedBitfield ? 32u : bits);
+            auto raw = readBuffer(context, instruction, addresses[component].guest, packToDword ? 32u : packToHalf ? 16u : bits);
             if (bits != 32u) {
                 const auto signedType = IsSignedFormatComponent(info.type);
                 const auto type = signedType ? TypeI32(state) : u32;
                 const auto input = signedType ? Unary(state, spv::OpBitcast, type, raw) : raw;
                 raw = state.module.AllocateId();
-                state.module.AddFunction(signedType ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, type, raw, input, ConstantU32(state, info.packedBitfield ? info.componentBitOffset[component] : 0u), ConstantU32(state, bits));
+                state.module.AddFunction(signedType ? spv::OpBitFieldSExtract : spv::OpBitFieldUExtract, type, raw, input, ConstantU32(state, packMulti ? info.componentBitOffset[component] : 0u), ConstantU32(state, bits));
                 if (signedType) raw = Unary(state, spv::OpBitcast, u32, raw);
             }
             return memory.d16 ? EmitD16FormatComponent(state, info, component, raw) : NormalizeFormatComponent(state, info, component, raw);
@@ -344,12 +464,32 @@ std::uint32_t formattedDispatch(SpirvValueEmitContext& context, const IrValue& i
         if (format == IrBufferFormat::Invalid) context.Fail(instruction, "formatted buffer instruction has an invalid constant format");
         return formatted(context, instruction, resource, GetFormatInfo(format), components, store, data);
     }
-    if (!memory.gpuDescriptor) return formattedCall(context, instruction, resource, components, store, data);
+    if (!memory.gpuDescriptor) {
+        const auto& formats = state.program.Resources().runtimeBufferFormats;
+        if (memory.resource < formats.size() && formats[memory.resource] != IrBufferFormat::Invalid) {
+            const auto format = formats[memory.resource];
+            const auto info = GetFormatInfo(format);
+            if (info.type != SpirvFormatComponentType::Unknown) {
+                if (state.program.Resources().stage == IrShaderStage::Compute) {
+                    std::fprintf(stderr, "[formattedDispatch 0x%llx] SPECIALIZED FORMAT %u for buffer %u!\n",
+                        static_cast<unsigned long long>(state.program.Resources().shaderHash),
+                        static_cast<unsigned>(format), memory.resource);
+                }
+                return formatted(context, instruction, resource, info, components, store, data);
+            }
+        }
+        return formattedCall(context, instruction, resource, components, store, data);
+    }
     return formattedGpuCall(context, instruction, resource, components, store, data);
 }
 
 std::uint32_t formatSwitch(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t components, bool store, std::uint32_t data) {
     auto& state = context.state;
+    if (state.program.Resources().stage == IrShaderStage::Compute) {
+        std::fprintf(stderr, "[formatSwitch 0x%llx] components=%u, store=%d\n",
+            static_cast<unsigned long long>(state.program.Resources().shaderHash),
+            components, store ? 1 : 0);
+    }
     const auto& memory = context.Memory(instruction);
     const auto format = field(state, resource.word3, 12u, 7u);
     const auto merge = state.module.AllocateId();

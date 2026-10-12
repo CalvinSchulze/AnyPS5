@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <array>
 
 namespace AgcDriver::DriverDetail {
 
@@ -100,50 +101,125 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
-            const auto bytes = store->Bytes();
-            if (bytes.empty()) {
-
+        if (opcode == 0x50 && packet.size() >= 7) {
+            const auto srcSel = Pm4::DmaSource(packet);
+            const auto dstSel = Pm4::DmaDestination(packet);
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            if (dstSel == Pm4::DmaSelectNowhere || bytes == 0) {
                 orderedAlready = true;
                 drained = false;
-            } else {
-
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                const auto localDevice = device.Load();
-
-                Graphics::StorageTexture::FlushPending(store->address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
-
-                recordDeferredLabels(localDevice.get(), submission.queue);
-                const auto stamp = ++eventSerial;
-                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
-                if (reason == 0 || reason == 5) {
-                    if (reason == 0) ++storesOnGpu;
-                    else ++storesBehindCompletions;
-                    wroteOnGpu = true;
-                    drained = false;
-                } else if (reason == 1) {
-                    GuestMemory::Write(store->address, bytes, 1);
-                    ++storesOnCpu;
-                    wroteOnGpu = true;
-                    drained = false;
+            } else if (dstSel == Pm4::DmaSelectGds) {
+                const auto gdsOffset = packet[4];
+                if (packet[5] == 0 && gdsOffset <= Pm4::GdsBytes && bytes <= Pm4::GdsBytes - gdsOffset) {
+                    auto* gdsDst = reinterpret_cast<void*>(Pm4::GdsAddress() + gdsOffset);
+                    if (srcSel == 2) {
+                        const auto val = packet[2];
+                        if (val == 0 || (val & 0xffu) * 0x01010101u == val) {
+                            std::memset(gdsDst, static_cast<int>(val & 0xffu), bytes);
+                        } else {
+                            auto* dst32 = reinterpret_cast<std::uint32_t*>(gdsDst);
+                            std::fill_n(dst32, bytes / 4, val);
+                        }
+                        wroteOnGpu = true;
+                        drained = false;
+                    } else if (Pm4::DmaMemorySelector(srcSel)) {
+                        const auto src = Pm4::DmaAddress(packet[2], packet[3]);
+                        if (GuestMemory::Accessible(reinterpret_cast<const void*>(src), bytes)) {
+                            std::memcpy(gdsDst, reinterpret_cast<const void*>(src), bytes);
+                            wroteOnGpu = true;
+                            drained = false;
+                        }
+                    }
                 }
-                Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
-            }
-        }
-        if (drained && opcode == 0x50) {
-            const auto copy = Pm4::DecodeMemoryCopy(packet);
-            if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
-                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
-                std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                if (const auto localDevice = device.Load()) {
-                    recordDeferredLabels(localDevice.get(), submission.queue);
-                    const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
-                    if (outcome.path == 1 || outcome.path == 3) {
+            } else if (srcSel == Pm4::DmaSelectGds && Pm4::DmaMemorySelector(dstSel)) {
+                const auto gdsOffset = packet[2];
+                if (packet[3] == 0 && gdsOffset <= Pm4::GdsBytes && bytes <= Pm4::GdsBytes - gdsOffset) {
+                    const auto dst = Pm4::DmaAddress(packet[4], packet[5]);
+                    const auto* gdsSrc = reinterpret_cast<const void*>(Pm4::GdsAddress() + gdsOffset);
+                    if (GuestMemory::Accessible(reinterpret_cast<const void*>(dst), bytes, true)) {
+                        std::memcpy(reinterpret_cast<void*>(dst), gdsSrc, bytes);
+                        GuestMemory::MarkWritten(dst, bytes);
                         wroteOnGpu = true;
                         drained = false;
                     }
+                }
+            } else if (srcSel == 2 && Pm4::DmaMemorySelector(dstSel)) {
+                const auto dst = Pm4::DmaAddress(packet[4], packet[5]);
+                if (bytes > 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(dst), bytes, true)) {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (const auto localDevice = device.Load()) {
+                        Graphics::StorageTexture::FlushPending(dst, bytes, nullptr, "packet fill", Graphics::PublishScope::PartialUnits);
+                        recordDeferredLabels(localDevice.get(), submission.queue);
+                        const std::array<std::uint32_t, 4> pattern{packet[2], packet[2], packet[2], packet[2]};
+                        if (localDevice->FillBuffer(dst, bytes, pattern)) {
+                            wroteOnGpu = true;
+                            drained = false;
+                        } else if (localDevice->RecordedWritesSettled(dst, bytes)) {
+                            const auto val = packet[2];
+                            if (val == 0 || (val & 0xffu) * 0x01010101u == val) {
+                                std::memset(reinterpret_cast<void*>(dst), static_cast<int>(val & 0xffu), bytes);
+                            } else {
+                                auto* dst32 = reinterpret_cast<std::uint32_t*>(dst);
+                                std::fill_n(dst32, bytes / 4, val);
+                            }
+                            GuestMemory::MarkWritten(dst, bytes);
+                            wroteOnGpu = true;
+                            drained = false;
+                        }
+                    }
+                }
+            } else if (Pm4::DmaMemorySelector(srcSel) && Pm4::DmaMemorySelector(dstSel)) {
+                const auto src = Pm4::DmaAddress(packet[2], packet[3]);
+                const auto dst = Pm4::DmaAddress(packet[4], packet[5]);
+                if (bytes > 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(src), bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(dst), bytes, true)) {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (const auto localDevice = device.Load()) {
+                        recordDeferredLabels(localDevice.get(), submission.queue);
+                        const auto outcome = localDevice->CopyBuffer(dst, src, bytes, std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                        if (outcome.path == 1 || outcome.path == 3 || outcome.path == 0) {
+                            wroteOnGpu = true;
+                            drained = false;
+                        } else if (localDevice->RecordedWritesSettled(src, bytes) && localDevice->RecordedWritesSettled(dst, bytes)) {
+                            std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
+                            GuestMemory::MarkWritten(dst, bytes);
+                            wroteOnGpu = true;
+                            drained = false;
+                        }
+                    }
+                }
+            }
+        }
+        if (drained) {
+            if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+                const auto bytes = store->Bytes();
+                if (bytes.empty()) {
+                    orderedAlready = true;
+                    drained = false;
+                } else {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    const auto localDevice = device.Load();
+
+                    Graphics::StorageTexture::FlushPending(store->address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+
+                    recordDeferredLabels(localDevice.get(), submission.queue);
+                    const auto stamp = ++eventSerial;
+                    const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                    if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                    if (reason == 0 || reason == 5) {
+                        if (reason == 0) ++storesOnGpu;
+                        else ++storesBehindCompletions;
+                        wroteOnGpu = true;
+                        drained = false;
+                    } else if (reason == 1) {
+                        GuestMemory::Write(store->address, bytes, 1);
+                        ++storesOnCpu;
+                        wroteOnGpu = true;
+                        drained = false;
+                    }
+                    Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 }
             }
         }

@@ -116,7 +116,11 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         const bool dynamic = info.images[i].mipMode == ImageMipMode::DynamicStorage;
         const std::uint32_t count = dynamic ? RuntimeAbi::StorageMipSlots : 1u;
         std::array<bool, ImageBindingCount> placed{};
-        for (const auto& mode : ResourceMaterializer::RuntimeImageModes(info.images[i])) {
+        const auto& infoModes = info.runtimeImageModes;
+        const auto modes = (i < infoModes.size() && !infoModes[i].empty())
+            ? infoModes[i]
+            : ResourceMaterializer::RuntimeImageModes(info.images[i]);
+        for (const auto& mode : modes) {
             const auto group = ImageBindingIndex(DescriptorBindingForImage(mode));
             if (placed.at(group)) continue;
             placed[group] = true;

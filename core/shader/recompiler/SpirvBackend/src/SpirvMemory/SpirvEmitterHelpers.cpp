@@ -415,7 +415,11 @@ void DefineDescriptors(SpirvEmitterState& state) {
             if (ImageBindingResourceClass(binding.kind) == ImageResourceClass::None) {
                 FailEmit("descriptor binding has an unmapped image resource class");
             }
-            const auto modes = ResourceMaterializer::RuntimeImageModes(state.program.Info().images.at(binding.resources.front()));
+            const auto resourceIndex = binding.resources.front();
+            const auto& infoModes = state.program.Info().runtimeImageModes;
+            const auto modes = (resourceIndex < infoModes.size() && !infoModes[resourceIndex].empty())
+                ? infoModes[resourceIndex]
+                : ResourceMaterializer::RuntimeImageModes(state.program.Info().images.at(resourceIndex));
             const auto selected = std::ranges::find_if(modes, [&](const ImageResource& mode) { return DescriptorBindingForImage(mode) == binding.kind; });
             if (selected == modes.end()) FailEmit("static image heap has no runtime mode");
             const auto& image = *selected;

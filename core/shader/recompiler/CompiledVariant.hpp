@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILER_COMPILEDVARIANT_HPP
 
 #include "Recompiler.hpp"
+#include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "IntermediateRepresentation/IrMetadata/CompiledShaderInfo.hpp"
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
 
@@ -12,6 +13,7 @@ struct CompiledVariant {
     CompiledShaderInfo info;
     CompiledBindingLayout bindings;
     CompiledShaderArtifact artifact;
+    std::vector<IrBufferFormat> bufferFormats;
 };
 
 }

@@ -1,5 +1,7 @@
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
+#include <cstdio>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include <fstream>
@@ -25,23 +27,43 @@ static constexpr int SCE_PLAYGO_ERROR_BAD_SIZE = static_cast<int>(0x80B2000B);
 static constexpr int SCE_PLAYGO_ERROR_BAD_LOCUS = static_cast<int>(0x80B20010);
 
 // The package's chunk table is not part of the dump, so the chunk set comes from the title's
-// playgo-chunkdefs.xml: every listed chunk plus chunks 0 through the default chunk. Games probe
-// chunk IDs and size arrays from the result, so unknown IDs must be rejected.
+// playgo-chunkdefs.xml or PS5 sce_sys/playgo-chunk.dat: every listed chunk plus chunks 0 through
+// the default chunk. Games probe chunk IDs and size arrays from the result, so unknown IDs must be rejected.
 static const std::set<uint16_t>& ValidChunks() {
     static const std::set<uint16_t> chunks = [] {
         std::set<uint16_t> result{0};
         std::ifstream file(ResolvePath_nid_no_patch("/app0/playgo-chunkdefs.xml"));
-        if (!file) return result;
-        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        static const std::regex chunk(R"re(<chunk\s+id="(\d+)")re");
-        for (auto it = std::sregex_iterator(text.begin(), text.end(), chunk); it != std::sregex_iterator(); ++it)
-            result.insert(static_cast<uint16_t>(std::stoul((*it)[1].str())));
-        static const std::regex defaultChunk(R"re(default_chunk="(\d+)")re");
-        std::smatch match;
-        if (std::regex_search(text, match, defaultChunk)) {
-            const auto last = std::stoul(match[1].str());
-            for (unsigned long id = 0; id <= last && id <= 0xFFFF; ++id) result.insert(static_cast<uint16_t>(id));
+        if (file) {
+            const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            static const std::regex chunk(R"re(<chunk\s+id="(\d+)")re");
+            for (auto it = std::sregex_iterator(text.begin(), text.end(), chunk); it != std::sregex_iterator(); ++it)
+                result.insert(static_cast<uint16_t>(std::stoul((*it)[1].str())));
+            static const std::regex defaultChunk(R"re(default_chunk="(\d+)")re");
+            std::smatch match;
+            if (std::regex_search(text, match, defaultChunk)) {
+                const auto last = std::stoul(match[1].str());
+                for (unsigned long id = 0; id <= last && id <= 0xFFFF; ++id) result.insert(static_cast<uint16_t>(id));
+            }
+            return result;
         }
+
+        // PS5 games store chunk definitions in sce_sys/playgo-chunk.dat (plgx format)
+        for (const auto* datPath : {"/app0/sce_sys/playgo-chunk.dat", "/app0/playgo-chunk.dat"}) {
+            std::ifstream datFile(ResolvePath_nid_no_patch(datPath), std::ios::binary);
+            if (datFile) {
+                char header[36] = {};
+                if (datFile.read(header, 36) && std::memcmp(header, "plgx", 4) == 0) {
+                    uint32_t count = 0;
+                    std::memcpy(&count, header + 0x20, 4);
+                    if (count > 0 && count <= 0xFFFF) {
+                        for (uint32_t id = 0; id < count; ++id) result.insert(static_cast<uint16_t>(id));
+                        std::fprintf(stderr, "[libScePlayGo] Loaded %u chunks from %s\n", count, datPath);
+                        return result;
+                    }
+                }
+            }
+        }
+
         return result;
     }();
     return chunks;
@@ -51,8 +73,12 @@ static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries)
     if (!chunk_ids) return SCE_PLAYGO_ERROR_BAD_POINTER;
     if (number_of_entries == 0) return SCE_PLAYGO_ERROR_BAD_SIZE;
     const auto& valid = ValidChunks();
-    for (uint32_t index = 0; index < number_of_entries; ++index)
-        if (!valid.contains(chunk_ids[index])) return SCE_PLAYGO_ERROR_BAD_CHUNK_ID;
+    for (uint32_t index = 0; index < number_of_entries; ++index) {
+        if (!valid.contains(chunk_ids[index])) {
+            if (valid.size() <= 1 && chunk_ids[index] != 0xFFFF) continue;
+            return SCE_PLAYGO_ERROR_BAD_CHUNK_ID;
+        }
+    }
     return 0;
 }
 

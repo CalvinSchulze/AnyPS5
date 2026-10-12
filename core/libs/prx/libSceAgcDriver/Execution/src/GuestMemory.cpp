@@ -1737,8 +1737,15 @@ void TagGpuLockSite(GpuLockSite site) {
     LockStats().nextSite = site;
 }
 
+thread_local bool presenterThread = false;
+
 void MarkPresenterThread() {
+    presenterThread = true;
     LockStats().holderColumn = PresenterColumn;
+}
+
+bool IsPresenterThread() {
+    return presenterThread || (GpuLockProfiled() && LockStats().holderColumn == PresenterColumn);
 }
 
 void NoteLockedGpuWait(double ms) {

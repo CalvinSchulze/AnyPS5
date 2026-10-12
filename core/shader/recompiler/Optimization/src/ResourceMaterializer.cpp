@@ -236,6 +236,14 @@ std::uint32_t MaterialScanLimit() {
     return limit;
 }
 
+std::uint32_t TableScanLimit() {
+    static const std::uint32_t limit = [] {
+        const char* text = std::getenv("APS5_BINDLESS_TABLE_SCAN");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 4096u;
+    }();
+    return limit;
+}
+
 bool BindlessTraced() {
     static const bool traced = std::getenv("APS5_TRACE_BINDLESS") != nullptr;
     return traced;
@@ -311,7 +319,7 @@ void traceTable(const IrResourcePlan& plan, const ImageResource& image, const De
     auto& last = seen[{plan.shaderHash, image.firstUsePc}];
     if (last == trace) return;
     last = trace;
-    std::fprintf(stderr, "[bindless] table at pc 0x%x of shader %llx: heap V# base 0x%llx entries %u, material V# base 0x%llx entries %u stride 0x%x offset 0x%x, mode %c, %u keys\n", image.firstUsePc, static_cast<unsigned long long>(plan.shaderHash), static_cast<unsigned long long>(heapBase), trace.entries, static_cast<unsigned long long>(materialBase), trace.materialEntries, table.selectorStride, table.selectorOffset, trace.material ? 'M' : 'T', trace.keys);
+    std::fprintf(stderr, "[bindless] table at pc 0x%x of shader %llx: heap V# base 0x%llx entries %u stride 0x%x offset 0x%x, material V# base 0x%llx entries %u stride 0x%x offset 0x%x, mode %c, %u keys\n", image.firstUsePc, static_cast<unsigned long long>(plan.shaderHash), static_cast<unsigned long long>(heapBase), trace.entries, table.entryStride, table.entryOffset, static_cast<unsigned long long>(materialBase), trace.materialEntries, table.selectorStride, table.selectorOffset, trace.material ? 'M' : 'T', trace.keys);
 }
 
 // The slots of the table image `imageIndex` (see TableResolution). Mode M enumerates the keys the
@@ -328,17 +336,35 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         throw std::runtime_error("bindless packed and BY2/BY4 image tables are unsupported");
     }
     const auto slots = ResourceMaterializer::BindlessSlots();
+    const std::uint32_t entryStride = table.entryStride != 0u ? table.entryStride : TableEntryBytes;
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
-    const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
-    const std::uint64_t heapSize = heap.GetSize();
-    if (heap.Type() != 0u || heap.Base48() > std::numeric_limits<std::uint64_t>::max() - heapSize) throw std::runtime_error("bindless heap buffer is invalid");
-    if (heapSize != 0u && (heapSize < table.entryOffset || (heapSize - table.entryOffset) % TableEntryBytes != 0u)) throw std::runtime_error("bindless heap contains a partial descriptor");
-    const auto entries = heapSize > table.entryOffset ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset) / TableEntryBytes, std::numeric_limits<std::uint32_t>::max())) : 0u;
-    const auto readWord = [&](std::uint64_t address, std::uint32_t& word) {
-        if (!runtime.readMemory(runtime.userContext, address, &word)) {
-            throw std::runtime_error("failed to read a bindless image table from memory");
+    std::uint64_t heapBase = 0;
+    std::uint64_t heapSize = 0;
+    std::uint32_t entries = 0;
+    if (heapValue.dwordCount == 2u) {
+        heapBase = (static_cast<std::uint64_t>(heapValue.dwords[1]) << 32u) | heapValue.dwords[0];
+        heapSize = static_cast<std::uint64_t>(slots) * entryStride + table.entryOffset;
+        entries = slots;
+    } else {
+        const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
+        heapBase = heap.Base48();
+        heapSize = heap.GetSize();
+        if (heap.Type() != 0u || heap.Base48() > std::numeric_limits<std::uint64_t>::max() - heapSize) throw std::runtime_error("bindless heap buffer is invalid");
+        const std::uint32_t minEntryBytes = std::min(entryStride, 32u);
+        if (heapSize < table.entryOffset + minEntryBytes) {
+            entries = 0u;
+        } else {
+            entries = static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset - minEntryBytes) / entryStride + 1u, std::numeric_limits<std::uint32_t>::max()));
         }
+    }
+    if (BindlessTraced()) {
+        std::fprintf(stderr, "[materializer] resolveTableImage: imageIndex %u, heapBase 0x%llx, heapSize 0x%llx, entries %u, slots %u, table.hasMaterial %d\n",
+            imageIndex, static_cast<unsigned long long>(heapBase), static_cast<unsigned long long>(heapSize), entries, slots, table.hasMaterial);
+        std::fflush(stderr);
+    }
+    const auto readWord = [&](std::uint64_t address, std::uint32_t& word) {
+        return runtime.readMemory(runtime.userContext, address, &word);
     };
 
     auto& counters = bindlessCounters();
@@ -348,22 +374,30 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     std::uint64_t materialBase = 0;
     std::uint32_t outOfRange = 0;
     if (table.hasMaterial) {
-        if (table.selectorStride < sizeof(std::uint32_t) || table.selectorOffset > table.selectorStride - sizeof(std::uint32_t)) throw std::runtime_error("bindless material selector is outside its record");
+        if (table.selectorStride < sizeof(std::uint32_t)) throw std::runtime_error("bindless material selector stride is too small");
         DescriptorValue materialValue;
         walker.EvaluateDescriptorSource(plan, table.materialSource, runtime, materialValue);
-        const ShaderBufferResource material = decodeBufferDescriptor(materialValue);
-        materialBase = material.Base48();
-        const std::uint64_t materialSize = material.GetSize();
-        if (material.Type() != 0u || materialSize % table.selectorStride != 0u) throw std::runtime_error("bindless material buffer has an invalid layout");
-        materialEntries = static_cast<std::uint32_t>(std::min<std::uint64_t>(materialSize / table.selectorStride, std::numeric_limits<std::uint32_t>::max()));
-        if (materialSize / table.selectorStride > MaterialScanLimit()) rejectTable(BindlessRejection::MaterialScan, "bindless material scan capacity exceeded");
+        if (materialValue.dwordCount == 2u) {
+            materialBase = (static_cast<std::uint64_t>(materialValue.dwords[1]) << 32u) | materialValue.dwords[0];
+            materialEntries = MaterialScanLimit();
+        } else {
+            const ShaderBufferResource material = decodeBufferDescriptor(materialValue);
+            materialBase = material.Base48();
+            const std::uint64_t materialSize = material.GetSize();
+            if (material.Type() != 0u) throw std::runtime_error("bindless material buffer has an invalid layout");
+            const std::uint64_t availableSize = materialSize > table.selectorOffset ? (materialSize - table.selectorOffset) : 0u;
+            materialEntries = static_cast<std::uint32_t>(std::min<std::uint64_t>(availableSize / table.selectorStride, std::numeric_limits<std::uint32_t>::max()));
+            if (materialEntries > MaterialScanLimit()) rejectTable(BindlessRejection::MaterialScan, "bindless material scan capacity exceeded");
+        }
         if (materialEntries <= MaterialScanLimit()) {
             materialMode = true;
             for (std::uint32_t record = 0; record < materialEntries; record++) {
                 const std::uint64_t offset = static_cast<std::uint64_t>(record) * table.selectorStride + table.selectorOffset;
-                if (offset + sizeof(std::uint32_t) > materialSize) throw std::runtime_error("bindless material selector exceeds its buffer");
                 std::uint32_t key = 0;
-                readWord(materialBase + offset, key);
+                if (!readWord(materialBase + offset, key)) {
+                    if (materialValue.dwordCount == 2u) break;
+                    throw std::runtime_error("failed to read a bindless image table from memory");
+                }
                 if (key >= entries) {
                     outOfRange++;
                     continue;
@@ -378,31 +412,88 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         }
     }
     if (!materialMode) {
-        if (entries > slots) {
-            rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), limit " + std::to_string(slots));
+        if (heapBase != 0) {
+            const std::uint32_t scanLimit = TableScanLimit();
+            if (entries > scanLimit) {
+                rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table has " + std::to_string(entries) + " entries (" + std::to_string(materialEntries) + " materials), scan limit " + std::to_string(scanLimit));
+            }
+            for (std::uint32_t key = 0; key < entries; ++key) {
+                DescriptorValue candidate;
+                candidate.dwordCount = 8u;
+                const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(key) * entryStride;
+                bool readOk = true;
+                const std::uint32_t dwordsToRead = std::min(8u, entryStride / static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+                for (std::uint32_t dword = 0u; dword < dwordsToRead; ++dword) {
+                    if (!readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword])) {
+                        readOk = false;
+                        break;
+                    }
+                }
+                for (std::uint32_t dword = dwordsToRead; dword < 8u; ++dword) {
+                    candidate.dwords[dword] = 0u;
+                }
+                if (!readOk) {
+                    if (heapValue.dwordCount == 2u) break;
+                    throw std::runtime_error("failed to read a bindless image table from memory");
+                }
+                if (nullImageDescriptor(candidate)) {
+                    continue;
+                }
+                if (!validImageDescriptor(candidate, image.r128)) {
+                    continue;
+                }
+                keys.push_back(key);
+                if (keys.size() > slots) {
+                    rejectTable(table.hasMaterial ? BindlessRejection::MaterialScan : BindlessRejection::Capacity, "bindless image table: active entries exceed " + std::to_string(slots) + " slots");
+                }
+            }
+            if (BindlessTraced()) {
+                std::fprintf(stderr, "[materializer] scanned table image: %zu active keys out of %u entries\n", keys.size(), entries);
+                std::fflush(stderr);
+            }
         }
-        keys.resize(entries);
-        for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
     }
     counters.outOfRange.fetch_add(outOfRange, std::memory_order_relaxed);
-    const std::uint64_t heapBase = heap.Base48();
     std::vector<DescriptorValue> candidates(keys.size());
     std::vector<std::uint8_t> valid(keys.size(), 0u);
     std::uint32_t paddedNull = 0u;
-    for (std::size_t i = 0u; i < keys.size(); ++i) {
-        auto& candidate = candidates[i];
-        candidate.dwordCount = 8u;
-        const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * TableEntryBytes;
-        for (std::uint32_t dword = 0u; dword < 8u; ++dword) readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
-        if (nullImageDescriptor(candidate)) {
-            ++paddedNull;
-            continue;
+    if (heapBase != 0) {
+        for (std::size_t i = 0u; i < keys.size(); ++i) {
+            auto& candidate = candidates[i];
+            candidate.dwordCount = 8u;
+            const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * entryStride;
+            bool readOk = true;
+            const std::uint32_t dwordsToRead = std::min(8u, entryStride / static_cast<std::uint32_t>(sizeof(std::uint32_t)));
+            for (std::uint32_t dword = 0u; dword < dwordsToRead; ++dword) {
+                if (!readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword])) {
+                    readOk = false;
+                    break;
+                }
+            }
+            for (std::uint32_t dword = dwordsToRead; dword < 8u; ++dword) {
+                candidate.dwords[dword] = 0u;
+            }
+            if (!readOk) {
+                if (heapValue.dwordCount == 2u) {
+                    break;
+                }
+                throw std::runtime_error("failed to read a bindless image table from memory");
+            }
+            if (nullImageDescriptor(candidate)) {
+                ++paddedNull;
+                continue;
+            }
+            if (!validImageDescriptor(candidate, image.r128)) {
+                if (heapValue.dwordCount == 2u) {
+                    break;
+                }
+                throw std::runtime_error("bindless image table contains an invalid descriptor");
+            }
+            const auto decoded = decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats);
+            if (decoded.fmask) throw std::runtime_error("bindless FMASK images are unsupported");
+            static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
+            valid[i] = 1u;
         }
-        if (!validImageDescriptor(candidate, image.r128)) throw std::runtime_error("bindless image table contains an invalid descriptor");
-        const auto decoded = decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats);
-        if (decoded.fmask) throw std::runtime_error("bindless FMASK images are unsupported");
-        static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
-        valid[i] = 1u;
     }
     resolution.mapping.clear();
     for (std::size_t i = 0u; i < keys.size(); ++i) {
@@ -576,7 +667,13 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");
     for (std::uint32_t i = 0u; i < plan.info.images.size(); ++i) {
         const auto& image = plan.info.images[i];
-        static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), plan.info.runtimeImageModes.at(i)));
+        const auto& modes = plan.info.runtimeImageModes.at(i);
+        if (modes.size() == 1u) {
+            const auto allModes = ResourceMaterializer::RuntimeImageModes(image);
+            static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), allModes));
+        } else {
+            static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), modes));
+        }
         const auto& table = tables.at(i);
         if (!plan.descriptorSources.at(image.source).indirectImage.has_value()) {
             if (!table.slots.empty()) throw std::runtime_error("direct image has runtime table slots");
@@ -786,7 +883,7 @@ std::uint32_t ResourceMaterializer::EmulatedCompareState(const ShaderInfo& info,
     return emulatedCompareState(info, snapshot, index);
 }
 
-void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeSampleOffsets) const {
+void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeSampleOffsets, const ResourceSnapshot* snapshot) const {
     auto& resources = program.Resources();
     if (!resources.resourceTrackingComplete || !resources.srtPlanComplete) throw std::runtime_error("static resource interface requires a completed resource plan");
     auto images = resources.info.images;
@@ -814,6 +911,11 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
         image.numericClass = image.atomic ? IrTextureNumericClass::Uint : IrTextureNumericClass::Float;
         image.mipCount = image.mipMode == ImageMipMode::DynamicStorage ? RuntimeAbi::StorageMipSlots : 1u;
         if (resources.descriptorSources.at(image.source).indirectImage.has_value()) {
+            if (BindlessTraced()) {
+                std::fprintf(stderr, "[materializer] ApplyStaticInterface: index %u (directCount %u), current images %zu, adding %u slots (limit %u)\n",
+                    index, directCount, images.size(), slots - 1u, ShaderInfo::MaxImages);
+                std::fflush(stderr);
+            }
             if (images.size() + slots - 1u > ShaderInfo::MaxImages) throw std::runtime_error("static bindless image capacity exceeded");
             image.indirectRoot = index;
             image.indirectResources.push_back(index);
@@ -838,13 +940,61 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
     resources.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(resources);
     resources.srtGuardOffset = mappingOffset;
     if (!resources.guardedSrtSlots.empty()) resources.info.usesFaultBuffer = true;
-    PrepareImageModes(resources.info);
+    PrepareImageModes(resources.info, snapshot);
+    resources.runtimeBufferFormats.clear();
+    if (snapshot != nullptr) {
+        resources.runtimeBufferFormats.reserve(resources.info.buffers.size());
+        for (std::size_t i = 0; i < resources.info.buffers.size(); ++i) {
+            if (i < snapshot->buffers.size() && snapshot->buffers[i].dwordCount == 4u) {
+                const auto& desc = snapshot->buffers[i];
+                const bool present = desc.dwords[0] != 0u || desc.dwords[1] != 0u || desc.dwords[2] != 0u || desc.dwords[3] != 0u;
+                const auto formatRaw = (desc.dwords[3] >> 12u) & 0x7fu;
+                if (present && formatRaw != 0u && formatRaw <= static_cast<std::uint32_t>(IrBufferFormat::Format32_32_32_32Float)) {
+                    const auto format = static_cast<IrBufferFormat>(formatRaw);
+                    if (resources.info.buffers[i].descriptorFormatted) {
+                        std::fprintf(stderr, "[ApplyStaticInterface] buffer %zu/%zu: RESOLVED format=%u\n",
+                            i, resources.info.buffers.size(), static_cast<unsigned>(format));
+                    }
+                    resources.runtimeBufferFormats.push_back(format);
+                    continue;
+                }
+            }
+            resources.runtimeBufferFormats.push_back(IrBufferFormat::Invalid);
+        }
+    }
 }
 
-void ResourceMaterializer::PrepareImageModes(ShaderInfo& info) {
+void ResourceMaterializer::PrepareImageModes(ShaderInfo& info, const ResourceSnapshot* snapshot) {
     info.runtimeImageModes.clear();
     info.runtimeImageModes.reserve(info.images.size());
-    for (const auto& image : info.images) info.runtimeImageModes.push_back(RuntimeImageModes(image));
+    for (std::size_t i = 0; i < info.images.size(); ++i) {
+        const auto& image = info.images[i];
+        auto allModes = RuntimeImageModes(image);
+        if (snapshot != nullptr && i < snapshot->images.size() && image.indirectRoot == ImageResource::NoIndirectImage) {
+            const auto& desc = snapshot->images[i];
+            std::fprintf(stderr, "[PrepareImageModes] img %zu/%zu: snapImg=%zu, indRoot=%u, descCount=%u, desc[0..3]=[%08x,%08x,%08x,%08x]\n",
+                i, info.images.size(), snapshot->images.size(), image.indirectRoot, desc.dwordCount,
+                desc.dwords[0], desc.dwords[1], desc.dwords[2], desc.dwords[3]);
+            if (desc.dwordCount == 8u) {
+                try {
+                    const auto activeIndex = RuntimeImageMode(image, desc, allModes);
+                    if (activeIndex < allModes.size()) {
+                        std::fprintf(stderr, "[PrepareImageModes] img %zu: RESOLVED activeIndex %zu of %zu modes! format=%u\n",
+                            i, activeIndex, allModes.size(), static_cast<unsigned>(allModes[activeIndex].packedFormat));
+                        info.runtimeImageModes.push_back({ allModes[activeIndex] });
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "[PrepareImageModes] img %zu: RuntimeImageMode THREW: %s\n", i, e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[PrepareImageModes] img %zu: RuntimeImageMode THREW unknown exception\n", i);
+                }
+            } else {
+                std::fprintf(stderr, "[PrepareImageModes] img %zu: desc is invalid width (dwordCount=%u)\n", i, desc.dwordCount);
+            }
+        }
+        info.runtimeImageModes.push_back(std::move(allModes));
+    }
 }
 
 namespace {

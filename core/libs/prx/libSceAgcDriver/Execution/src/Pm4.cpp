@@ -90,15 +90,15 @@ void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset
 }
 
 bool memorySelector(std::uint32_t selector) {
-    return selector == 0 || selector == 3;
+    return DmaMemorySelector(selector);
 }
 
 std::uint32_t dmaSource(std::span<const std::uint32_t> packet) {
-    return ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+    return DmaSource(packet);
 }
 
 std::uint32_t dmaDestination(std::span<const std::uint32_t> packet) {
-    return ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
+    return DmaDestination(packet);
 }
 
 // The bytes a COPY_DATA or DMA_DATA stores: an immediate is a repeating 32-bit pattern, a memory
@@ -113,9 +113,6 @@ std::vector<std::byte> copySource(std::uint64_t source, std::size_t bytes, bool 
     }
     return data;
 }
-
-constexpr std::uint32_t DmaSelectGds = 1;
-constexpr std::uint32_t DmaSelectNowhere = 2;
 
 bool gdsRange(std::uint64_t offset, std::size_t bytes) {
     return offset <= GdsBytes && bytes <= GdsBytes - offset;
@@ -614,6 +611,15 @@ std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet
     const auto destination = address(packet[4], packet[5]);
     if (bytes == 0 || (source < destination + bytes && destination < source + bytes)) return std::nullopt;
     return MemoryCopy{source, destination, bytes};
+}
+
+std::optional<MemoryFill> DecodeMemoryFill(std::span<const std::uint32_t> packet) {
+    if (packet.size() != 7 || ((packet[0] >> 8u) & 0xffu) != 0x50) return std::nullopt;
+    if (dmaSource(packet) != 2 || !memorySelector(dmaDestination(packet))) return std::nullopt;
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    const auto destination = address(packet[4], packet[5]);
+    if (bytes == 0 || destination % 4 != 0 || bytes % 4 != 0) return std::nullopt;
+    return MemoryFill{destination, bytes, packet[2]};
 }
 
 bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {

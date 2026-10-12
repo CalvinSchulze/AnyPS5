@@ -140,6 +140,31 @@ struct MemoryCopy {
     std::size_t bytes;
 };
 std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet);
+struct MemoryFill {
+    std::uint64_t destination;
+    std::size_t bytes;
+    std::uint32_t value;
+};
+std::optional<MemoryFill> DecodeMemoryFill(std::span<const std::uint32_t> packet);
+
+constexpr std::uint32_t DmaSelectGds = 1;
+constexpr std::uint32_t DmaSelectNowhere = 2;
+
+inline bool DmaMemorySelector(std::uint32_t selector) {
+    return selector == 0 || selector == 3;
+}
+
+inline std::uint32_t DmaSource(std::span<const std::uint32_t> packet) {
+    return ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
+}
+
+inline std::uint32_t DmaDestination(std::span<const std::uint32_t> packet) {
+    return ((packet[1] >> 20u) & 3u) | ((packet[6] >> 25u) & 4u) | ((packet[6] >> 26u) & 8u);
+}
+
+inline std::uint64_t DmaAddress(std::uint32_t low, std::uint32_t high) {
+    return low | (static_cast<std::uint64_t>(high) << 32u);
+}
 // A DISPATCH_INDIRECT's arguments: the guest address of its three group-count dwords (no memory
 // access, so the GPU can read them in place: VulkanDevice::DispatchIndirect), the DISPATCH_DIRECT
 // packet made by reading them there (through the checked guest memory path, which waits for

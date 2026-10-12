@@ -368,12 +368,19 @@ std::uint64_t nextVariantId() {
     return variants.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr) try {
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, std::exception_ptr* emissionFailure = nullptr, const ResourceSnapshot* snapshot = nullptr) try {
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
     const bool nativeSampleOffsets = request.target.nonConstantImageOffsets && std::find(request.target.supportedCapabilities.begin(), request.target.supportedCapabilities.end(), spv::CapabilityImageGatherExtended) != request.target.supportedCapabilities.end();
-    resourceMaterializer.ApplyStaticInterface(program, nativeSampleOffsets);
+    resourceMaterializer.ApplyStaticInterface(program, nativeSampleOffsets, snapshot);
+
+    if (request.shader.stage == ShaderStage::Compute) {
+        std::fprintf(stderr, "[compileVariant 0x%llx] snap=%p, imgs=%zu, rtModes=%zu, blocks=%zu, buffers=%zu\n",
+            static_cast<unsigned long long>(request.shader.codeAddress),
+            snapshot, program.Info().images.size(), program.Info().runtimeImageModes.size(),
+            program.Blocks().size(), program.Info().buffers.size());
+    }
 
     deadCodeEliminator.RemoveIdentities(program);
     deadCodeEliminator.Eliminate(program);
@@ -398,6 +405,11 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
     result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+
+    if (request.shader.stage == ShaderStage::Compute) {
+        std::fprintf(stderr, "[compileVariant 0x%llx] spirvEmitter produced %zu words\n",
+            static_cast<unsigned long long>(request.shader.codeAddress), result.spirv.size());
+    }
 
     result.bdaAbiVersion = program.Info().usesDma || program.Info().usesFaultBuffer ? request.target.bdaAbiVersion : 0u;
     result.memoryOffsetDword = bindings.layout.memoryOffsetDword;
@@ -453,7 +465,8 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     }
 #endif
 
-    return {request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result)};
+    auto bufferFormats = std::move(program.Resources().runtimeBufferFormats);
+    return {request.layout, std::move(program).TakeCompiledInfo(), std::move(static_cast<CompiledBindingLayout&>(bindings)), std::move(result), std::move(bufferFormats)};
 } catch (const std::bad_alloc&) {
     throw;
 } catch (...) {
@@ -472,7 +485,12 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
     for (const auto& constant : constants) {
-        if (!supplied.emplace(constant.id, constant.value).second) throw std::runtime_error("duplicate prepared specialization ID");
+        if (!supplied.emplace(constant.id, constant.value).second) {
+            std::fprintf(stderr, "[recompiler] duplicate prepared specialization ID %u (existing value %u, new value %u)\n",
+                constant.id, supplied[constant.id], constant.value);
+            std::fflush(stderr);
+            throw std::runtime_error("duplicate prepared specialization ID " + std::to_string(constant.id));
+        }
     }
     std::map<std::uint32_t, std::uint32_t> values;
     std::set<std::uint32_t> specializedIds;
@@ -777,18 +795,79 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
-std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
+std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr, const ResourceSnapshot* snapshot = nullptr) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
-            cacheHit = true;
-            return candidate;
+            bool matchesImages = true;
+            if (snapshot != nullptr) {
+                const auto& modes = candidate->info.info.runtimeImageModes;
+                for (std::size_t i = 0; i < candidate->info.info.images.size(); ++i) {
+                    if (candidate->info.info.images[i].indirectRoot != ImageResource::NoIndirectImage) continue;
+                    if (i < modes.size() && modes[i].size() > 1u) {
+                        matchesImages = false;
+                        break;
+                    }
+                    if (i < snapshot->images.size()) {
+                        try {
+                            const auto allModes = ResourceMaterializer::RuntimeImageModes(candidate->info.info.images[i]);
+                            const auto currentMode = ResourceMaterializer::RuntimeImageMode(candidate->info.info.images[i], snapshot->images[i], allModes);
+                            if (modes.empty() || i >= modes.size() || modes[i].empty() || allModes[currentMode] != modes[i].front()) {
+                                matchesImages = false;
+                                break;
+                            }
+                        } catch (...) {
+                            matchesImages = false;
+                            break;
+                        }
+                    } else {
+                        matchesImages = false;
+                        break;
+                    }
+                }
+                if (matchesImages) {
+                    for (std::size_t i = 0; i < candidate->bufferFormats.size(); ++i) {
+                        if (candidate->bufferFormats[i] == IrBufferFormat::Invalid) continue;
+                        if (i < snapshot->buffers.size() && snapshot->buffers[i].dwordCount == 4u) {
+                            const auto currentFormat = static_cast<IrBufferFormat>((snapshot->buffers[i].dwords[3] >> 12u) & 0x7fu);
+                            if (candidate->bufferFormats[i] != currentFormat) {
+                                matchesImages = false;
+                                break;
+                            }
+                        } else {
+                            matchesImages = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (std::size_t i = 0; i < candidate->info.info.images.size(); ++i) {
+                    if (candidate->info.info.images[i].indirectRoot != ImageResource::NoIndirectImage) continue;
+                    const auto& modes = candidate->info.info.runtimeImageModes;
+                    if (i < modes.size() && modes[i].size() == 1u) {
+                        matchesImages = false;
+                        break;
+                    }
+                }
+                if (matchesImages) {
+                    for (const auto fmt : candidate->bufferFormats) {
+                        if (fmt != IrBufferFormat::Invalid) {
+                            matchesImages = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (matchesImages) {
+                cacheHit = true;
+                return candidate;
+            }
         }
     }
     for (const auto& failure : source.emissionFailures) {
         if (failure.codeAddress == request.shader.codeAddress && sameLayout(failure.layout, request.layout)) std::rethrow_exception(failure.failure);
     }
     cacheHit = false;
-    const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
+    const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive() && snapshot == nullptr;
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
     if (disk) {
@@ -805,7 +884,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         source.program.reset();
         std::exception_ptr emissionFailure;
         try {
-            variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure));
+            variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), &emissionFailure, snapshot));
         } catch (...) {
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
@@ -822,7 +901,7 @@ RecompileResult materializeVariant(SourceEntry& source, const RecompileRequest& 
     bool cacheHit = false;
     {
         std::lock_guard lock(source.mutex);
-        variant = findOrCompileVariant(source, request, cacheHit);
+        variant = findOrCompileVariant(source, request, cacheHit, nullptr, &snapshot);
     }
     auto result = materializeResult(*variant, request, snapshot);
     result.cacheHit = cacheHit;
@@ -839,7 +918,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         auto program = PrepareResourceProgram(request);
         const auto plan = materializer.ExtractPlan(program);
         materializer.Materialize(plan, runtime, snapshot);
-        const auto variant = compileVariant(request, std::move(program));
+        const auto variant = compileVariant(request, std::move(program), nullptr, &snapshot);
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
@@ -992,7 +1071,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     bool cacheHit = false;
     {
         std::lock_guard lock(source.mutex);
-        variant = findOrCompileVariant(source, request, cacheHit);
+        variant = findOrCompileVariant(source, request, cacheHit, nullptr, &snapshot);
     }
     return materializePreparedMemoized(source, variant, request, snapshot, cacheHit, memoHit);
 }
@@ -1002,7 +1081,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
 std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (!request.useCache || capture.source == nullptr) {
         auto program = PrepareResourceProgram(request);
-        const auto variant = compileVariant(request, std::move(program));
+        const auto variant = compileVariant(request, std::move(program), nullptr, &capture.snapshot);
         return std::make_shared<const RecompileResult>(materializeResult(variant, request, capture.snapshot));
     }
     if (!ResultMemo()) return std::make_shared<const RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot));
@@ -1146,9 +1225,15 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
     if (capture.source != handle->source || capture.plan != handle->source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
-    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
-    auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
-    result->cacheHit = true;
+    std::shared_ptr<const CompiledVariant> variant;
+    bool cacheHit = false;
+    {
+        std::lock_guard lock(handle->source->mutex);
+        variant = findOrCompileVariant(*handle->source, request, cacheHit, nullptr, &capture.snapshot);
+    }
+    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, variant, request, capture.snapshot, cacheHit, nullptr);
+    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, capture.snapshot));
+    result->cacheHit = cacheHit;
     return result;
 }
 
@@ -1160,9 +1245,15 @@ const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
     if (!MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
     if (capture.source != handle.source || capture.plan != handle.source->plan) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
-    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
-    auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
-    result->cacheHit = true;
+    std::shared_ptr<const CompiledVariant> variant;
+    bool cacheHit = false;
+    {
+        std::lock_guard lock(handle.source->mutex);
+        variant = findOrCompileVariant(*handle.source, request, cacheHit, nullptr, &capture.snapshot);
+    }
+    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, variant, request, capture.snapshot, cacheHit, nullptr);
+    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, capture.snapshot));
+    result->cacheHit = cacheHit;
     return result;
 }
 
