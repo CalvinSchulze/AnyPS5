@@ -101,22 +101,81 @@ Duplikate trivial. Es erklärt also nichts von den 65 ms, wohl aber einen Teil d
 428 Code-Words, 14 Blöcke, 8 Schleifen → **26.939 SPIR-V-Words** (63x), 876 Blöcke,
 `8x8x1` Threads, wave64, LDS 0. laneCount-Faktor 1,35x.
 
+## Codegröße erklärt die Kosten nicht
+
+Alle 12 Programme aus der `[gputime]`-Liste liegen als Dump vor und wurden
+nachgerechnet (`ms/Frame` = `ms pro 10 s` / 68 Presents):
+
+| Programm | ms/Frame | Code-Words | SPIR-V | Faktor |
+|---|---|---|---|---|
+| `0x800038be00` | **64,87** | 1288 | 131.454 | 102x |
+| `0x80003e8700` | 18,60 | 428 | 26.939 | 63x |
+| `0x8000269d00` | **2,38** | 4976 | **711.493** | 143x |
+| `0x80003bfe00` | 1,09 | 808 | 84.838 | 105x |
+| `0x80003e6400` | 1,07 | 440 | 74.287 | 169x |
+| `0x80003ed000` | 0,85 | 380 | 26.630 | 70x |
+| `0x80003f3600` | 0,56 | 336 | 23.396 | 70x |
+| `0x7ff6b46cf600` | 0,37 | 60 | 1.275 | 21x |
+| `0x8000405300` | 0,24 | 248 | 21.850 | 88x |
+| `0x80003cd800` | **0,21** | 656 | **186.103** | 284x |
+| `0x8000423300` | 0,12 | 132 | 11.443 | 87x |
+| `0x8000414300` | 0,09 | 180 | 11.977 | 67x |
+
+`0x8000269d00` hat **5,4x mehr SPIR-V** als der Flaschenhals und kostet **27x weniger**.
+`0x80003cd800` hat 1,4x mehr Code und kostet 309x weniger. Die Expansion von 102x,
+die 15x Block-Zersplitterung und die 34 % Masken-Ops sind also **kein hinreichender
+Grund** für die 65 ms — sonst müssten diese beiden Programme die Liste anführen.
+
+**Vorbehalt:** die Invocation-Zahlen der anderen Programme sind ungemessen. Die Tabelle
+widerlegt „Kosten ∝ Codegröße", sie beweist noch nicht, woran es stattdessen liegt.
+
 ## Offen — das entscheidet die Richtung
 
-Die statische Analyse belegt schlechte Codegen-Qualität, **beweist aber keine
-Laufzeit-Zuordnung**. 65 ms für einen 4K-Compute-Pass liegen grob eine
-Größenordnung über dem, was so ein Pass nativ kostet. Was fehlt:
+1. **Invocations pro Programm.** Ohne sie ist nicht zu trennen, ob `0x800038be00` teuer
+   pro Invocation ist oder einfach als einziges über den vollen 4K-Grid läuft. Das ist
+   die billigste und am stärksten unterscheidende Messung.
+2. **Schleifen-Trip-Counts.** 8 Schleifen, Hauptschleife 21 Blöcke. Datenabhängig und
+   statisch nicht bestimmbar.
+3. **ALU- oder Memory-bound, Occupancy, Registerdruck.** Das Projekt hat kein
+   `VK_KHR_performance_query`, dafür braucht es Nsight.
 
-1. **Schleifen-Trip-Counts.** 8 Schleifen, Hauptschleife 21 Blöcke. Ob die 65 ms aus
-   Codegröße oder aus Iterationszahl kommen, ist ungemessen — und das ändert die
-   Antwort vollständig.
-2. **ALU- oder Memory-bound?** 10 Memory-Regionen, 34 % Masken-Ops. Ohne diese
-   Trennung ist nicht klar, ob Codegen-Aufräumen überhaupt etwas bringt.
-3. **Occupancy / Registerdruck.** Ein 131k-Words-Modul erzeugt ein großes natives
-   Binary; niedrige Occupancy würde Speicherlatenz nicht mehr verstecken.
+### Messplan
 
-Nächster Schritt ist eine Laufzeitmessung (Nsight auf dem laufenden Titel oder
-`[gputime]`-Klassen gegen das Programm), nicht weitere Statik.
+**A — Invocations für alle Programme, ein Lauf, in-project.**
+
+```
+APS5_PROFILE_GPU=1 APS5_PROFILE_DRAW=1 APS5_TRACE_DISPATCH_GEOMETRY=1 .\app.exe
+```
+
+Die Sonde meldet einmal pro Programm `groups=` und `indirect=`; mit den Threads pro
+Gruppe aus dem Replay ergibt das die Invocations. Daraus `ms pro Mio. Invocations` je
+Programm. Liegt `0x800038be00` dabei im Feld, ist es schlicht der einzige Voll-4K-Pass
+und die Frage heißt Auflösung/HLE. Ist es ein Ausreißer pro Invocation, sitzt das
+Problem im Shader (Trip-Counts, Speicher).
+
+**B — Wave64-Kosten real messen, ein A/B.**
+
+```
+APS5_PROFILE_GPU=1 APS5_SINGLE_LANE=800038be00 .\app.exe
+```
+
+`HostSubgroupSize` (`Recompiler.cpp:84`) akzeptiert eine Adress-Teilzeichenkette, der
+Schalter trifft also nur dieses Programm und setzt `laneCount` auf 1. Der
+`[gputime]`-Wert gegen den Basislauf gibt die 1,90x Codegröße in Millisekunden.
+Semantik ändert sich (Cross-Lane läuft über Workgroup- statt Subgroup-Scope), das Bild
+also auf Korrektheit prüfen.
+
+**C — nur falls A und B es nicht klären:** Nsight Graphics GPU Trace / Nsight Compute
+für SM- gegen Memory-Throughput, Occupancy und Stall-Gründe; `sm__inst_executed` pro
+Dispatch geteilt durch die Invocations aus A ergibt die effektiven Trip-Counts.
+
+**Methodik für A und B:** `[gputime]` aggregiert über 10-s-Fenster, die Läufe müssen
+also dieselbe Szene zeigen — gleicher Spielstand, Kamera geparkt, mehrere aufeinander
+folgende Fenster vergleichen. Der Shader-Disk-Cache muss in beiden Läufen gleich warm
+sein, sonst verfälschen Recompiles das Bild.
+
+`[gputime] by program` braucht **`APS5_PROFILE_GPU`** (`Recorder.cpp:1800`);
+`APS5_PROFILE_DRAW` allein liefert nur die Batch-Stempel.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
