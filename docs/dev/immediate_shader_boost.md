@@ -20,6 +20,39 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
+## Hier morgen weitermachen
+
+**Stand:** `0x800038be00` ist als **Pro-Invocation-Ausreißer** eingekreist — 8,002 ms pro
+Mio. Invocations, wo drei Programme mit *identischer* Invocation-Zahl 0,013–0,067
+brauchen. Der Mechanismus dahinter ist identifiziert, aber **nicht als Ursache belegt**:
+die Gast-Arena ist ein 3416-MiB-Host-Import im System-RAM, und weil der Shader
+`PhysicalStorageBufferAddresses` deklariert, bindet er diese Ranges in place — jeder
+Zugriff geht über PCIe.
+
+**Offen:** der Eingriffs-Test. `APS5_NO_HOST_IMPORT=1` erzwingt Kopien statt
+In-place-Zugriff. Fällt der `[gputime]`-Posten von `0x800038be00` deutlich unter die
+Basislinie von 4122–4314 ms pro 10 s, ist PCIe-in-place die Ursache; bleibt er flach,
+ist er es nicht. Zwei Läufe, Details unter
+[Nächster Schritt](#nächster-schritt--kausalität-durch-eingriff-kein-profiler).
+
+**Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
+
+| Hypothese | Womit widerlegt |
+|---|---|
+| Auflösung / 4K-Grid | Drei Programme mit denselben 8.294.400 Invocations kosten 0,013–0,067 ms/Mio. |
+| SPIR-V-Codegröße (102x Expansion) | `0x8000269d00` hat 5,4x mehr Code und kostet 27x weniger |
+| Schleifen / Trip-Counts | `0x80003e8700` ist schleifenfrei und pro Invocation teurer |
+| Wave64 auf Subgroup-32 | Alle zwölf Programme sind wave64, auch die billigen; Codeeffekt nur 1,90x |
+| Speicherbandbreite | ~34 MB pro Dispatch in 66 ms = ~0,5 GB/s von ~960 GB/s |
+| Written-Shadow-Fenster | `MAX_KIB` 2048→20480 flach; Staging-Set identisch, Filter nie erreicht |
+| Buffer-Zahl als Prädiktor | Zwei Programme mit je 3 Buffern liegen 6,8x auseinander |
+| BDA als Prädiktor | Teuerstes Programm pro Invocation nutzt kein BDA |
+
+**Konstanten-Duplikation** (10,6 % des Moduls) bleibt ein echter, aber **separater**
+Defekt: Compile-Zeit, nicht GPU-Zeit. Nicht mit fps-Erwartung anfassen.
+
+**Daten und Werkzeuge:** siehe [Werkzeuge](#werkzeuge) am Ende.
+
 ## Aktives Ziel: `0x800038be00`
 
 ### Gast-Shader — klein
@@ -314,15 +347,37 @@ Mutex. Erst relevant, wenn die GPU entlastet ist.
 
 ## Werkzeuge
 
+Messlauf (`[gputime] by program` braucht `APS5_PROFILE_GPU`, nicht `APS5_PROFILE_DRAW`):
+
 ```
-APS5_DUMP_SHADERS=1 APS5_PROFILE_DRAW=1 APS5_TRACE_DISPATCH_GEOMETRY=800038be00 .\app.exe
-agc_shader_replay [--asm] [--cfg] [--spv] shader_800038be00.req
-APS5_SINGLE_LANE=all agc_shader_replay ...     # laneCount=1 zum Vergleich
+APS5_PROFILE_GPU=1 APS5_PROFILE_DRAW=1 APS5_DUMP_SHADERS=1 APS5_TRACE_DISPATCH_GEOMETRY=1 .pp.exe
 ```
 
-`agc_shader_replay` braucht `libc.prx` im `PATH`. `--cfg` gibt pro Block
-`words=` aus — das ist `estimatedSpirvWords`, eine **Heuristik** des Structurizers,
-keine Messung des Ergebnisses; für echte Größen den `--spv`-Dump auswerten.
+Offline-Auswertung der Dumps:
+
+```
+agc_shader_replay [--asm] [--cfg] [--spv] [--mem] shader_<adresse>.req
+APS5_SINGLE_LANE=all agc_shader_replay ...          # laneCount=1 zum Vergleich
+python _analytics/tools/spirv_stats.py  <modul>.spv  # Größe, Blöcke, Opcodes, Konstanten, BDA
+python _analytics/tools/cfg_summary.py  cfg.txt      # Back-Edges und Schleifenkörper
+```
+
+`agc_shader_replay` braucht `libc.prx` im `PATH`
+(`build/core/libs/libs/unpatched`). `--cfg` gibt pro Block `words=` aus — das ist
+`estimatedSpirvWords`, eine **Heuristik** des Structurizers (`GraphBuilder.cpp:19`),
+keine Messung des Ergebnisses; echte Größen nur über `--spv` und `spirv_stats.py`.
+
+Nützliche Schalter, alle verifiziert: `APS5_TRACE_DISPATCH_GEOMETRY=<hex|1>`,
+`APS5_SINGLE_LANE=<hex|all>`, `APS5_TRACE_STAGING=1`, `APS5_TRACE_HOST_IMPORT=1`,
+`APS5_WRITTEN_SHADOW_MAX_KIB`, `APS5_NO_HOST_IMPORT=1`, `APS5_ADDRESS_COPY_MAX_MIB`
+(Default 64, darüber `abort()`), `APS5_PROBE_DISPATCH=<hex>[:index]`.
+
+**Achtung:** `APS5_NO_WRITTEN_SHADOW=1` führt nach ~30 s zum `SIGABRT` in VideoOut
+(gemischte DCC-Keys) — nicht als Gegenprobe brauchbar.
+
+Die Rohdaten liegen unter `_analytics/` (gitignored, nicht im Repo):
+`game_debug.log`, `shaders/shader_*.req`, `written_shadow_tests/`,
+`host_import_trace/`, `mem/`, und die beiden Skripte in `tools/`.
 
 ## Referenz: Kostenverteilung CPU-Seite
 
