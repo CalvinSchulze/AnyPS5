@@ -29,11 +29,17 @@ die Gast-Arena ist ein 3416-MiB-Host-Import im System-RAM, und weil der Shader
 `PhysicalStorageBufferAddresses` deklariert, bindet er diese Ranges in place — jeder
 Zugriff geht über PCIe.
 
-**Offen:** der Eingriffs-Test. `APS5_NO_HOST_IMPORT=1` erzwingt Kopien statt
-In-place-Zugriff. Fällt der `[gputime]`-Posten von `0x800038be00` deutlich unter die
-Basislinie von 4122–4314 ms pro 10 s, ist PCIe-in-place die Ursache; bleibt er flach,
-ist er es nicht. Zwei Läufe, Details unter
-[Nächster Schritt](#nächster-schritt--kausalität-durch-eingriff-kein-profiler).
+**Erster Schritt morgen:** der Eingriffs-Test mit `APS5_NO_HOST_IMPORT=1` **läuft
+bereits** und ist gültig — es sind nur noch zwei Zeilen abzulesen, siehe
+[Nächster Schritt](#nächster-schritt--der-eingriffs-test-läuft-schon). Kein weiterer
+Lauf nötig, `APS5_ADDRESS_COPY_MAX_MIB` braucht es **nicht**.
+
+1. `[gputime] by program` → Posten `0x800038be00` gegen die Basislinie
+   **4122–4314 ms / 10 s**. Deutlicher Abfall ⇒ PCIe-in-place ist die Ursache.
+   Flach ⇒ ist es nicht, dann Nsight (`ncu` ist auf dem Messrechner nicht installiert).
+2. `[buffers] image mirrors:` → Kontrolle, dass der Eingriff gegriffen hat. Basislinie
+   war `1 ranges (1.5 MiB, 0 writable)`; das muss jetzt deutlich höher stehen und
+   `writable > 0` zeigen. Tut es das nicht, sagt Punkt 1 nichts aus.
 
 **Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
 
@@ -300,28 +306,30 @@ Was zählt, ist offenbar die Zahl der **Zugriffe pro Invocation**, nicht die Zah
 gebundenen Buffer — und die ist statisch nicht ablesbar. Der Mechanismus ist damit der
 plausibelste Hauptverdächtige, aber als Kausalaussage fehlt der Eingriff.
 
-### Nächster Schritt — Kausalität durch Eingriff, kein Profiler
+### Nächster Schritt — der Eingriffs-Test läuft schon
 
-`APS5_NO_HOST_IMPORT=1` schaltet `VK_EXT_external_memory_host` ab
-(`VulkanDevice.cpp:956`). Adressierbare Builds müssen die Ranges dann **kopieren**
-statt in place zu lesen, der Zugriff läuft also device-local. Fällt `0x800038be00`
-dabei deutlich, ist PCIe-in-place die Ursache; bleibt es flach, ist es das nicht.
+`APS5_NO_HOST_IMPORT=1` lässt `hostImportAlignment` auf 0 (`VulkanDevice.cpp:956`
+überspringt die Abfrage), damit ist `importable == false` (`GuestBufferMemory.cpp:1748`)
+und die Import-Stufe fällt weg. Entscheidend ist, was dann greift — die Kette in
+`GuestBufferMemory.cpp:1812-1849` hat **drei** Stufen, nicht zwei:
 
-Vorsicht bei der Grenze: `APS5_ADDRESS_COPY_MAX_MIB` steht auf **64 MiB**, und ein
-Überschreiten ruft `std::abort()` mit `FATAL: an address-based build copies <n> MiB of
-<k> registered ranges, past 64 MiB` (`GuestBufferMemory.cpp:1445`, `:1857`).
+```
+1. importable            -> Host-Import, in place über PCIe        (mit dem Schalter aus)
+2. sonst mirrorsEnabled  -> acquireMirror() -> device-local Mirror  (fängt die Ranges auf)
+3. nur wenn der Mirror ablehnt -> addCopiedRange() -> zählt gegen APS5_ADDRESS_COPY_MAX_MIB
+```
 
-1. **Erst mit Default laufen.** Der Abbruch ist selbst das Messergebnis: die Meldung
-   listet die acht größten kopierten Ranges mit Größe und Grund und sagt damit, wie viel
-   Gast-Speicher ein adressierbarer Build dieses Shaders überhaupt anfasst.
-2. **Dann mit angehobener Grenze**, z. B. `APS5_ADDRESS_COPY_MAX_MIB=4096`, und
-   `[gputime] by program` gegen die Basislinie (4122–4314 ms) vergleichen. Die
-   Kopierkosten tauchen separat auf (`[address]`-Zeile, `guest memory upload`), die
-   fps dürfen also sinken — entscheidend ist allein der Posten `0x800038be00`.
+**Es gibt deshalb keinen Abort und es braucht keinen zweiten Lauf.** Stufe 2 bedient die
+Ranges aus einem Lease-Mirror, `copies` bleibt leer, `AddressCopyOverflow` sieht 0 MiB.
+Ein Lease-Mirror ist device-local — das ist genau die gewünschte Intervention, nur über
+Stufe 2 statt über Stufe 3. Ein Lauf über 1200 Frames ohne Abbruch bestätigt das.
 
-Nsight Compute bleibt die Rückfallebene, ist aber auf dem Messrechner nicht installiert
-und wird durch diesen Eingriff auch nicht gebraucht: er testet die Hypothese direkt,
-statt sie aus Countern zu erschließen.
+Abbrechen würde es nur für Ranges, die **auch der Mirror** ablehnt; die Gründe stehen in
+`:1848`: `APS5_NO_LEASE_MIRROR` gesetzt, `unreadable pages` (sparse),
+`image mirror refused` (nicht releasable), `outside the write-watched arena`.
+
+Auszulesen sind die zwei Zeilen aus dem Kasten oben. Methodik: letzte zwei
+`[gputime]`-Fenster bei geparkter Kamera, `[present]` zur fps-Kontrolle mitnehmen.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
