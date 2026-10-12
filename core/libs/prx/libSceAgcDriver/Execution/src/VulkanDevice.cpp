@@ -42,6 +42,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <array>
 #include <optional>
+#include <set>
 #include <algorithm>
 #include <cstring>
 #include <deque>
@@ -2891,6 +2892,20 @@ bool TraceDispatchIo() {
     return traceIo;
 }
 
+bool TraceDispatchGeometry(std::uint64_t programAddress) {
+    static const std::optional<std::uint64_t> selected = []() -> std::optional<std::uint64_t> {
+        const char* text = std::getenv("APS5_TRACE_DISPATCH_GEOMETRY");
+        if (text == nullptr) return std::nullopt;
+        return std::strtoull(text, nullptr, 16);
+    }();
+    if (!selected) return false;
+    if (*selected != 0 && (programAddress & 0xfffffffffull) != (*selected & 0xfffffffffull)) return false;
+    static std::mutex reportedMutex;
+    static std::set<std::uint64_t> reported;
+    std::lock_guard lock(reportedMutex);
+    return reported.insert(programAddress).second;
+}
+
 void WatchMemory(std::uint64_t programAddress) {
     struct Range {
         std::uint64_t address = 0;
@@ -3545,13 +3560,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
-    if (record.programAddress == 0x800038be00) {
-        static bool once = false;
-        if (!once) {
-            once = true;
-            std::fprintf(stderr, "[dispatch 0x800038be00] groups=%ux%ux%u indirect=%s\n",
-                record.x, record.y, record.z, argumentImport != nullptr ? "yes" : "no");
-        }
+    if (TraceDispatchGeometry(record.programAddress)) {
+        std::fprintf(stderr, "[dispatch-geometry] 0x%llx groups=%ux%ux%u indirect=%s, subgroup %u, workgroup memory %u dwords, %zu SPIR-V words\n",
+            static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z,
+            argumentImport != nullptr ? "yes" : "no", record.shader->program->hostSubgroupSize,
+            record.shader->program->workgroupMemoryDwords, record.shader->program->spirv.size());
     }
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
