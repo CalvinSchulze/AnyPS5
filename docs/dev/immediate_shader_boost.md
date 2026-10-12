@@ -358,8 +358,8 @@ Offline-Auswertung der Dumps:
 ```
 agc_shader_replay [--asm] [--cfg] [--spv] [--mem] shader_<adresse>.req
 APS5_SINGLE_LANE=all agc_shader_replay ...          # laneCount=1 zum Vergleich
-python _analytics/tools/spirv_stats.py  <modul>.spv  # Größe, Blöcke, Opcodes, Konstanten, BDA
-python _analytics/tools/cfg_summary.py  cfg.txt      # Back-Edges und Schleifenkörper
+python tools/spirv_stats.py  <modul>.spv             # Größe, Blöcke, Opcodes, Konstanten, BDA
+python tools/cfg_summary.py  cfg.txt                 # Back-Edges und Schleifenkörper
 ```
 
 `agc_shader_replay` braucht `libc.prx` im `PATH`
@@ -375,9 +375,13 @@ Nützliche Schalter, alle verifiziert: `APS5_TRACE_DISPATCH_GEOMETRY=<hex|1>`,
 **Achtung:** `APS5_NO_WRITTEN_SHADOW=1` führt nach ~30 s zum `SIGABRT` in VideoOut
 (gemischte DCC-Keys) — nicht als Gegenprobe brauchbar.
 
+`spirv_stats.py` meldet nebenbei das Addressing-Model: `PhysicalStorageBuffer64` beim
+Flaschenhals gegen `Logical` bei den billigen Pässen — das ist dasselbe `addressable`,
+das in `stagingEligible` das Staging blockiert.
+
 Die Rohdaten liegen unter `_analytics/` (gitignored, nicht im Repo):
 `game_debug.log`, `shaders/shader_*.req`, `written_shadow_tests/`,
-`host_import_trace/`, `mem/`, und die beiden Skripte in `tools/`.
+`host_import_trace/`, `mem/`.
 
 ## Referenz: Kostenverteilung CPU-Seite
 
