@@ -2896,7 +2896,10 @@ bool TraceDispatchGeometry(std::uint64_t programAddress) {
     static const std::optional<std::uint64_t> selected = []() -> std::optional<std::uint64_t> {
         const char* text = std::getenv("APS5_TRACE_DISPATCH_GEOMETRY");
         if (text == nullptr) return std::nullopt;
-        return std::strtoull(text, nullptr, 16);
+        char* end = nullptr;
+        const auto address = std::strtoull(text, &end, 16);
+        constexpr std::ptrdiff_t addressDigits = 8;
+        return end - text >= addressDigits ? address : 0ull;
     }();
     if (!selected) return false;
     if (*selected != 0 && (programAddress & 0xfffffffffull) != (*selected & 0xfffffffffull)) return false;
