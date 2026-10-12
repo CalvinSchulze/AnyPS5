@@ -29,17 +29,21 @@ die Gast-Arena ist ein 3416-MiB-Host-Import im System-RAM, und weil der Shader
 `PhysicalStorageBufferAddresses` deklariert, bindet er diese Ranges in place — jeder
 Zugriff geht über PCIe.
 
-**Erster Schritt morgen:** der Eingriffs-Test mit `APS5_NO_HOST_IMPORT=1` **läuft
-bereits** und ist gültig — es sind nur noch zwei Zeilen abzulesen, siehe
-[Nächster Schritt](#nächster-schritt--der-eingriffs-test-läuft-schon). Kein weiterer
-Lauf nötig, `APS5_ADDRESS_COPY_MAX_MIB` braucht es **nicht**.
+**Ursache belegt.** Der Eingriffs-Test ist durch: `APS5_NO_HOST_IMPORT=1` senkt die
+GPU-Zeit des Flaschenhalses um **2,4x** und die des zweiten Shaders um **6,4x**, während
+die bildbasierten Pässe sich nicht bewegen. PCIe-In-place-Zugriff ist damit als Ursache
+belegt — aber nur für **~60 %** der Kosten, und der Eingriff selbst ist unbrauchbar
+(1,2 fps). Zahlen und Vorbehalte unter
+[Eingriffs-Test](#eingriffs-test-ursache-belegt-fix-noch-nicht).
 
-1. `[gputime] by program` → Posten `0x800038be00` gegen die Basislinie
-   **4122–4314 ms / 10 s**. Deutlicher Abfall ⇒ PCIe-in-place ist die Ursache.
-   Flach ⇒ ist es nicht, dann Nsight (`ncu` ist auf dem Messrechner nicht installiert).
-2. `[buffers] image mirrors:` → Kontrolle, dass der Eingriff gegriffen hat. Basislinie
-   war `1 ranges (1.5 MiB, 0 writable)`; das muss jetzt deutlich höher stehen und
-   `writable > 0` zeigen. Tut es das nicht, sagt Punkt 1 nichts aus.
+**Erster Schritt morgen:** die Fix-Richtung entscheiden. Das Mirroring der ganzen Arena
+ist zu teuer, das Written-Shadow-Staging ist für adressierbare Builds gesperrt. Die
+offene Frage ist, ob sich die BDA-Zeiger auf einen gestagten device-lokalen Puffer
+**umschreiben** lassen — siehe [Fix-Richtung](#fix-richtung-offene-frage).
+
+**Zweite offene Front:** nach dem Eingriff bleiben 27,6 ms pro Dispatch = 3,33 ms pro
+Mio. Invocations, immer noch 50–250x über den billigen 4K-Pässen. Da sitzt eine
+**zweite, unabhängige Kostenquelle**, die wir noch nicht kennen.
 
 **Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
 
@@ -306,30 +310,75 @@ Was zählt, ist offenbar die Zahl der **Zugriffe pro Invocation**, nicht die Zah
 gebundenen Buffer — und die ist statisch nicht ablesbar. Der Mechanismus ist damit der
 plausibelste Hauptverdächtige, aber als Kausalaussage fehlt der Eingriff.
 
-### Nächster Schritt — der Eingriffs-Test läuft schon
+### Eingriffs-Test: Ursache belegt, Fix noch nicht
 
-`APS5_NO_HOST_IMPORT=1` lässt `hostImportAlignment` auf 0 (`VulkanDevice.cpp:956`
-überspringt die Abfrage), damit ist `importable == false` (`GuestBufferMemory.cpp:1748`)
-und die Import-Stufe fällt weg. Entscheidend ist, was dann greift — die Kette in
-`GuestBufferMemory.cpp:1812-1849` hat **drei** Stufen, nicht zwei:
+`APS5_NO_HOST_IMPORT=1` lässt `hostImportAlignment` auf 0 (`VulkanDevice.cpp:956`), damit
+ist `importable == false` (`GuestBufferMemory.cpp:1748`) und die Import-Stufe fällt weg.
+Die Kette in `:1812-1849` hat **drei** Stufen, nicht zwei:
 
 ```
 1. importable            -> Host-Import, in place über PCIe        (mit dem Schalter aus)
 2. sonst mirrorsEnabled  -> acquireMirror() -> device-local Mirror  (fängt die Ranges auf)
-3. nur wenn der Mirror ablehnt -> addCopiedRange() -> zählt gegen APS5_ADDRESS_COPY_MAX_MIB
+3. nur wenn der Mirror ablehnt -> addCopiedRange() -> gegen APS5_ADDRESS_COPY_MAX_MIB
 ```
 
-**Es gibt deshalb keinen Abort und es braucht keinen zweiten Lauf.** Stufe 2 bedient die
-Ranges aus einem Lease-Mirror, `copies` bleibt leer, `AddressCopyOverflow` sieht 0 MiB.
-Ein Lease-Mirror ist device-local — das ist genau die gewünschte Intervention, nur über
-Stufe 2 statt über Stufe 3. Ein Lauf über 1200 Frames ohne Abbruch bestätigt das.
+Deshalb kam **kein Abort** und es brauchte keinen zweiten Lauf: Stufe 2 bedient alles,
+`copies` bleibt leer. Ein Lease-Mirror ist device-local — genau die gewünschte
+Intervention, nur über Stufe 2.
 
-Abbrechen würde es nur für Ranges, die **auch der Mirror** ablehnt; die Gründe stehen in
-`:1848`: `APS5_NO_LEASE_MIRROR` gesetzt, `unreadable pages` (sparse),
-`image mirror refused` (nicht releasable), `outside the write-watched arena`.
+**Kontrolle, dass der Eingriff griff:** `host import of` kommt 0x vor, und
 
-Auszulesen sind die zwei Zeilen aus dem Kasten oben. Methodik: letzte zwei
-`[gputime]`-Fenster bei geparkter Kamera, `[present]` zur fps-Kontrolle mitnehmen.
+| | Basislinie | `NO_HOST_IMPORT=1` |
+|---|---|---|
+| `image mirrors` | 1 range, 1,5 MiB, 0 writable | **856 ranges, 4278 MiB, 855 writable** |
+
+**Ergebnis pro Dispatch** (`ms pro 10 s` / Dispatch-Zahl, Basislinie 65 Presents gegen
+12 im Eingriff):
+
+| Programm | Basislinie | Eingriff | Faktor | Art |
+|---|---|---|---|---|
+| `0x800038be00` | 66,4 ms | **27,6 ms** | **2,4x schneller** | BDA, 12 Buffer |
+| `0x80003e8700` | 19,1 ms | **3,0 ms** | **6,4x schneller** | BDA, 3 Buffer |
+| `0x8000269d00` | 2,38 ms | 2,0 ms | 1,2x | kein BDA |
+| `0x80003e6400` | 1,05 ms | 1,0 ms | — | BDA, 1 Buffer |
+| `0x80003ed000` | 0,86 ms | 0,92 ms | — | bildbasiert |
+| `0x80003f3600` | 0,55 ms | 0,67 ms | — | bildbasiert |
+| `0x7ff6b46cf600` | 0,37 ms | 0,33 ms | — | — |
+| `0x8000405300` | 0,25 ms | 0,23 ms | — | 0 Buffer, 5 Images |
+
+Die Signatur ist exakt die vorhergesagte: **nur** die beiden in place gebundenen
+Vielfach-Buffer-Shader fallen, die bildbasierten Pässe rühren sich nicht. Das ist
+Kausalität, nicht Korrelation.
+
+**Warum es kein Fix ist:** die Kosten wandern auf die CPU. 12 Presents statt 65
+(1,2 fps), `idle gaps 773,2 ms` pro Present bei `GPU busy 50,7 ms` — die GPU steht. Die
+`[address]`-Zeile nennt den Grund: `mirror prepare 44055 us per build`, also **44 ms pro
+Build**, bei 154 adressbasierten Builds pro 10 s, plus 327.619 Refreshes, 6,25 Mio.
+verglichene und 5,05 Mio. kopierte Blöcke. Die ganze 4,3-GB-Arena zu spiegeln und pro
+Build nachzuziehen ist teurer als der PCIe-Zugriff.
+
+**Vorbehalt zur Messung:** der Eingriffslauf läuft bei 1,2 fps mit 94 % GPU-Leerlauf.
+Taktzustände, Cache-Residenz und fehlende Parallelarbeit unterscheiden sich damit von
+der Basislinie; die Richtung und die Selektivität der Signatur sind überzeugend, die
+genauen Faktoren 2,4x und 6,4x sind weich.
+
+### Fix-Richtung (offene Frage)
+
+Gebraucht wird device-lokale Ablage **nur für die Ranges, die der heiße Shader wirklich
+anfasst** — nicht für die ganze Arena. Genau das tut das Written-Shadow-Staging, und es
+ist für adressierbare Builds gesperrt, laut Kommentar in `:2148` weil
+„AddressRanges needs a device address".
+
+Ein device-lokaler Staging-Puffer **hat** aber eine Device-Adresse. Die offene Frage ist
+deshalb, ob sich in der BDA-Tabelle die Adresse des Stagings statt der des Imports
+veröffentlichen lässt (`AddressRanges`, `BdaResources.cpp`, die
+`ShaderRecompiler::BdaAbi::Range`-Liste in `:1866`). Gelingt das, greift die Staging-
+Logik mitsamt ihrem Größenfenster für genau die sechs geschriebenen Buffer, ohne die
+Arena zu spiegeln.
+
+Zu klären, bevor etwas gebaut wird: ob Gast-Zeiger-Arithmetik im Shader über
+Range-Grenzen hinweg rechnet (dann bricht ein Remap), und wie die Rück-Kopie mit den
+`direct`-Schreibmarken und der Pending-Write-Notiz zusammenspielt.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
