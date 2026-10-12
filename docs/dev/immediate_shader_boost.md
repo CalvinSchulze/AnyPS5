@@ -118,24 +118,24 @@ Die 102x Expansion, die 15x Block-Zersplitterung und die 34 % Masken-Ops sind da
 **kein hinreichender Grund** für die 66 ms — sonst müssten die beiden größten Module die
 Liste anführen. Codegröße ist als Haupterklärung ausgeschlossen.
 
-## Phase A durch: es sind die Guest-Buffer, nicht die Pixel
+## Phase A: ein Pro-Invocation-Ausreißer
 
 `APS5_TRACE_DISPATCH_GEOMETRY=1` lieferte die Grids aller 86 Programme, die Threads pro
 Gruppe kommen aus dem Replay. `ms/Frame` = `ms pro 10 s` / 65 Presents.
 
-| Programm | ms/Frame | Grid | Threads | Invocations | **ms/Mio. Inv** | Buffers | Regionen | Images |
-|---|---|---|---|---|---|---|---|---|
-| `0x8000269d00` | 2,38 | 1x64x36 | 4x4x4 | 147.456 | 16,172 | 24 | 46 | 29 |
-| `0x80003e8700` | 19,08 | 240x135x1 | 8x8x1 | 2.073.600 | 9,200 | 3 | 10 | 2 |
-| `0x80003bfe00` | 1,14 | 60x34x1 | 8x8x1 | 130.560 | 8,720 | — | — | — |
-| `0x800038be00` | **66,37** | 240x135x1 | 16x16x1 | **8.294.400** | **8,002** | **12** | **10** | 1 |
-| `0x80003ed000` | 0,86 | 64x32x1 | 8x8x1 | 131.072 | 6,573 | — | — | — |
-| `0x7ff6b46cf600` | 0,37 | 2040x1x1 | 64x1x1 | 130.560 | 2,828 | — | — | — |
-| `0x80003cd800` | 0,20 | 64x36x1 | 4x4x4 | 147.456 | 1,356 | 3 | 6 | 2 |
-| `0x80003e6400` | 1,05 | 240x135x1 | 8x8x1 | 2.073.600 | 0,505 | 1 | 4 | 3 |
-| `0x80003f3600` | 0,55 | 480x270x1 | 8x8x1 | **8.294.400** | **0,067** | 1 | 3 | 3 |
-| `0x8000405300` | 0,25 | 480x270x1 | 8x8x1 | **8.294.400** | **0,030** | 0 | 3 | 5 |
-| `0x8000423300` | 0,11 | 480x270x1 | 8x8x1 | **8.294.400** | **0,013** | 0 | 3 | 2 |
+| Programm | ms/Frame | Grid | Threads | Invocations | **ms/Mio. Inv** | Buffers | Reg. | Img | BDA |
+|---|---|---|---|---|---|---|---|---|---|
+| `0x8000269d00` | 2,38 | 1x64x36 | 4x4x4 | 147.456 | 16,172 | 24 | 46 | 29 | nein |
+| `0x80003e8700` | 19,08 | 240x135x1 | 8x8x1 | 2.073.600 | 9,200 | 3 | 10 | 2 | ja |
+| `0x80003bfe00` | 1,14 | 60x34x1 | 8x8x1 | 130.560 | 8,720 | — | — | — | ja |
+| `0x800038be00` | **66,37** | 240x135x1 | 16x16x1 | **8.294.400** | **8,002** | **12** | **10** | 1 | ja |
+| `0x80003ed000` | 0,86 | 64x32x1 | 8x8x1 | 131.072 | 6,573 | — | — | — | nein |
+| `0x7ff6b46cf600` | 0,37 | 2040x1x1 | 64x1x1 | 130.560 | 2,828 | — | — | — | nein |
+| `0x80003cd800` | 0,20 | 64x36x1 | 4x4x4 | 147.456 | 1,356 | 3 | 6 | 2 | ja |
+| `0x80003e6400` | 1,05 | 240x135x1 | 8x8x1 | 2.073.600 | 0,505 | 1 | 4 | 3 | ja |
+| `0x80003f3600` | 0,55 | 480x270x1 | 8x8x1 | **8.294.400** | **0,067** | 1 | 3 | 3 | nein |
+| `0x8000405300` | 0,25 | 480x270x1 | 8x8x1 | **8.294.400** | **0,030** | 0 | 3 | 5 | nein |
+| `0x8000423300` | 0,11 | 480x270x1 | 8x8x1 | **8.294.400** | **0,013** | 0 | 3 | 2 | nein |
 
 (`0x800035d400`: 64 Invocations bei 1x1x1-Grid, 1442 ms/Mio. — Launch-Overhead, kein
 Signal.)
@@ -151,10 +151,13 @@ Es ist ein Pro-Invocation-Ausreißer.
 230 Instruktionen) und kostet pro Invocation mit 9,200 sogar *mehr* als der Flaschenhals.
 Trip-Counts können die gemeinsame Ursache nicht sein.
 
-**Was übrig bleibt und monoton mitläuft, ist die Zahl der Guest-Buffer:**
-0 Buffer → 0,013 / 0,030 · 1 Buffer → 0,067 / 0,505 · 3 Buffer → 1,356 / 9,200 ·
-12 Buffer → 8,002 · 24 Buffer → 16,172. Images korrelieren nicht (die billigsten Pässe
-haben die meisten).
+**Kein statisches Attribut sagt die Kosten vorher.** Die Buffer-Zahl sah über eine
+Teilmenge monoton aus, hält über alle elf Programme aber nicht: `0x80003cd800` und
+`0x80003e8700` haben beide **3 Buffer** und liegen 7x auseinander (1,356 gegen 9,200).
+Auch BDA trennt nicht — `0x8000269d00` ist pro Invocation das teuerste und nutzt
+**kein** `PhysicalStorageBufferAddresses`, während die billigen `0x80003e6400` (0,505)
+und `0x80003cd800` (1,356) es nutzen. Images korrelieren negativ, wenn überhaupt: die
+billigsten Pässe haben die meisten.
 
 ### Die V#-Deskriptoren von `0x800038be00`
 
@@ -180,69 +183,81 @@ unbeschäftigt — die Kosten stecken im Overhead *pro Zugriff*, nicht im Volume
 Dazu passen die gemessenen 34 % Bit-Manipulation im emittierten Code: Sub-Dword-Zugriffe
 (Stride 1 und 2 Byte) auf format-spezialisierte Buffer werden mit Shift/Mask/Select
 nachgebaut.
+## Widerlegt: das Written-Shadow-Fenster ist nicht der Gate
 
-## Hypothese: die geschriebenen Buffer liegen im Host-Speicher
-
-Der Mechanismus ist im Projekt bereits beschrieben — `GuestBufferMemory.cpp:2138`:
+Begründet war der Verdacht durch `GuestBufferMemory.cpp:2138`:
 
 > *"A written V# element bound in place makes the shader store into host memory over
 > PCIe: the froxel culling kernel's ~248K scattered 4-byte stores took 2.8 ms per
-> dispatch and the histogram kernels' ~60K atomics on a 1 KB bin table 1.4 ms, on a GPU
-> that is otherwise idle."*
+> dispatch [...] on a GPU that is otherwise idle."*
 
-Die Gegenmaßnahme ist das **Written-Shadow-Staging**: ein geschriebenes Element wird in
-einen `DEVICE_LOCAL`-Buffer kopiert, dort gebunden und zurückkopiert. Sie ist aber
-größenbegrenzt (`stagingEligible`, `GuestBufferMemory.cpp:2295`):
+Die Gegenmaßnahme (Written-Shadow-Staging) ist über `APS5_WRITTEN_SHADOW_MAX_KIB` auf
+2048 KiB begrenzt, die geschriebenen Buffer des Flaschenhalses sind 16,6 / 8,2 / 4,1 /
+4,1 MB. Gemessen auf RTX 5080, warmer Disk-Cache, identische Szene:
 
-```cpp
-return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
+| Lauf | `MAX_KIB` | `0x800038be00` | gestagte Regionen |
+|---|---|---|---|
+| R0 | 2048 (Default) | 4299 ms | 392 / 180.704 KiB |
+| R1 | 5120 | 4220 ms | 200 / 88.544 KiB |
+| R2 | 9216 | 4275 ms | 397 / 182.944 KiB |
+| R3 | 20480 | 4333 ms | 392 / 180.704 KiB |
+
+**Flach.** Und R5 (`APS5_TRACE_STAGING=1`) entscheidet es: das Staging-Set ist bei
+Default und bei 20480 KiB **identisch** — genau 8 Regionen, alle ≤ 640 KiB. Die großen
+Buffer tauchen nie auf, der Größenfilter wird also gar nicht erreicht. Sie scheitern
+früher in `stagingEligible` (`GuestBufferMemory.cpp:2295`), an einem von
+`stagingAllowed`, `addressable`, `unstaged`, `sparse`, `mirror != nullptr` oder
+`WritesOverlap`.
+
+`addressable` wurde geprüft und reicht als Erklärung nicht: die Kosten pro Invocation
+trennen sich nicht entlang `PhysicalStorageBufferAddresses` (siehe Tabelle oben).
+
+### Nebenbefund aus R4: das Staging trägt die DCC-Keys
+
+`APS5_NO_WRITTEN_SHADOW=1` bricht nach ~30 s reproduzierbar ab:
+
+```
+VideoOut: display buffer 0x5005160000 reads mixed DCC keys at 0x5007168000 over its
+0x28000 key bytes [...] presenting DCC metadata that is not uniformly uncompressed or
+fast-cleared is not implemented
 ```
 
-`APS5_WRITTEN_SHADOW_MIN_KIB` / `MAX_KIB` sind **16 / 2048 KiB**. Die geschriebenen
-Buffer von `0x800038be00` sind **16,6 / 8,2 / 4,1 / 4,1 MB** — alle vier liegen über dem
-2-MiB-Fenster und werden damit **in place gebunden**, also ins Host-RAM über PCIe
-geschrieben, von 8,29 Mio. Invocations mit einem Record pro Invocation.
+Die genannte Range `0x5007168000+0x28000` ist eine der acht gestagten Regionen. Das
+Written-Shadow-Staging hält also die DCC-Keys kohärent; ohne es wird ein Display-Buffer
+mit gemischten Keys präsentiert und der Titel terminiert. Damit ist die Gegenprobe
+nicht gelaufen — und ein Debug-Schalter, der in einen `SIGABRT` führt, ist für sich
+notierenswert.
 
-Für diesen Ausschluss gibt es **keinen Zähler** — die `0 shadows refused` auf der
-`[buffers]`-Zeile zählen etwas anderes, der Größenfilter greift stumm davor.
+## Offen — ab hier reicht Statik nicht mehr
 
-Die Begründung der Obergrenze im Kommentar nimmt Streaming an („a kernel streaming once
-through a large buffer [...] would only gain the two copies"). Dieser Shader streamt
-nicht, er schreibt gestreut — genau der Fall, den derselbe Kommentar als katastrophal
-beschreibt.
+Gesichert ist: `0x800038be00` ist ein **Pro-Invocation-Ausreißer** (8,002 gegen
+0,013–0,067 ms/Mio. bei identischer Invocation-Zahl), und es ist **nicht** Auflösung,
+**nicht** Codegröße, **nicht** Schleifen, **nicht** wave64, **nicht** Bandbreite und
+**nicht** das Written-Shadow-Fenster. Kein statisch ablesbares Attribut sagt die Kosten
+vorher.
 
-Das erklärt außerdem, warum die Kosten mit der **Buffer-Zahl** skalieren und nicht mit
-Codegröße, Invocations oder Schleifen, und warum die Bandbreite bei 0,5 GB/s brachliegt:
-PCIe-Latenz pro gestreutem Store, nicht Volumen.
+Was bleibt, ist nur noch von innerhalb der GPU zu beantworten: ausgeführte
+Instruktionen, Speicherlatenz, Occupancy, Zugriffsmuster. Das Projekt hat kein
+`VK_KHR_performance_query`.
 
-### Nächster Schritt — Dosis-Wirkungs-Kurve, kein Profiler
+**Nsight Compute auf den einen Dispatch** (er ist trivial zu finden: längster Dispatch
+im Frame, 71 % der GPU-Zeit). Gebraucht werden SM- gegen Memory-Throughput, Occupancy
+(erreicht gegen theoretisch), die Top-Stall-Gründe, und `sm__inst_executed` geteilt
+durch 8.294.400 — gegen die 30.244 statischen SPIR-V-Instruktionen gerechnet trennt das
+Instruktionszahl von Latenz.
 
-`APS5_WRITTEN_SHADOW_MAX_KIB` stufenweise erhöhen, sodass die Buffer einzeln ins
-Staging-Fenster wandern, und jeweils `[gputime] by program` vergleichen:
-
-| `MAX_KIB` | zusätzlich gestaged | Erwartung bei zutreffender Hypothese |
-|---|---|---|
-| 2048 (Default) | — | Basislinie, ~4310 ms / 10 s |
-| 5120 | 2x 4,1 MB | erster Abfall |
-| 9216 | + 8,2 MB | weiterer Abfall |
-| 20480 | + 16,6 MB | größter Abfall |
-
-Gegenprobe in der anderen Richtung: `APS5_NO_WRITTEN_SHADOW=1` bindet **alle**
-geschriebenen Elemente in place, also auch die heute gestagten kleinen. Dann muss
-insbesondere `0x80003e8700` (3 Buffer, heute im Fenster) **schlechter** werden — trifft
-das nicht ein, ist die Hypothese falsch.
-
-`APS5_TRACE_STAGING=1` listet jede gestagte Range einmal mit Größe und zeigt direkt, ob
-die großen Buffer im Staging-Set auftauchen.
+**Flankierend, ein Lauf, billig:** `APS5_TRACE_HOST_IMPORT=1` druckt
+`[gpu] host import of 0x<base>+0x<bytes> ok` (`GuestBufferMemory.cpp:637`). Erscheinen
+darin die V#-Basen des Flaschenhalses (Buffer 4 `0x5009771200+0xfd2000`, Buffer 10
+`0x500a762c40`), liegen diese Ranges als Host-Import im System-RAM und jeder Zugriff
+geht über PCIe — die PCIe-Erklärung wäre dann bestätigt, nur eben nicht über den
+Staging-Pfad.
 
 **Methodik:** `[gputime]` aggregiert über 10-s-Fenster, Läufe müssen dieselbe Szene
-zeigen (gleicher Spielstand, Kamera geparkt, die letzten Fenster vergleichen, nicht die
-ersten), und der Shader-Disk-Cache muss gleich warm sein. `[gputime] by program` braucht
+zeigen (gleicher Spielstand, Kamera geparkt, die letzten Fenster vergleichen), und der
+Shader-Disk-Cache muss gleich warm sein. `[gputime] by program` braucht
 **`APS5_PROFILE_GPU`** (`Recorder.cpp:1800`); `APS5_PROFILE_DRAW` allein liefert nur die
 Batch-Stempel.
-
-Nsight bleibt die Rückfallebene, falls die Kurve flach bleibt: dann ist die Frage
-Instruktionszahl gegen Latenz, und das Projekt hat kein `VK_KHR_performance_query`.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
