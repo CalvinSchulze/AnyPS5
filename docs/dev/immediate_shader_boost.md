@@ -511,46 +511,26 @@ auflistet und mit seinen V#-Basen vergleicht.
 
 ## Warum eine leere Szene 120 ms kostet
 
-Die Frage ist berechtigt: eine RTX 5080 müsste das nebenbei aushusten. Die Antwort ist
-kein einzelner Fehler, sondern **drei gemessene Steuern** — und zwei davon sind Arbeit, die
-das Spiel nie bestellt hat.
+Der Beweis, dass es **nicht die Hardware** ist, steht im eigenen Frame: `0x80003f3600`
+fährt dieselben 8.294.400 Invocations auf demselben 4K-Grid wie der Flaschenhals und kostet
+**0,55 ms**. Ein Voll-4K-Pass ist auf dieser Karte weit unter einer Millisekunde; der
+Flaschenhals kostet 27,6 ms, also **50x** mehr für dieselbe Thread-Zahl.
 
-**Der Beweis, dass es nicht die Hardware ist, steht im eigenen Frame.** `0x80003f3600`
-fährt **dieselben 8.294.400 Invocations** auf demselben 4K-Grid wie der Flaschenhals und
-kostet **0,55 ms**. Die Hardware kann einen Voll-4K-Pass also deutlich unter einer
-Millisekunde. Der Flaschenhals kostet 27,6 ms. Der Faktor liegt bei uns, nicht an ihr.
+Drei Steuern, zwei davon Arbeit, die kein PS5-Spiel verursacht:
 
-**1. Die Szene ist nicht billig, nur leer.** Der Renderer weiß nicht, dass die Welt leer
-ist: er fährt trotzdem Froxel-Culling über 8,29 Mio. Invocations, einen zweiten Pass über
-2,07 Mio. mit 16 Image-Fetches pro Invocation, 25 Draws auf 4K-Targets mit DCC und löscht
-140 MiB pro Present. Das ist echte angeforderte Arbeit.
+1. **Die Szene ist nicht billig, nur leer** — der Renderer weiß das nicht und fährt die
+   volle Auflösung.
+2. **Die Übersetzungssteuer**, der größte Posten, von der Codemenge her nicht reduzierbar.
+3. **~38 ms reiner Emulator-Abfall:** 24 ms Image-Round-Trip und 18,4 ms, weil jeder Draw
+   seinen eigenen Render-Pass öffnet (`render passes 2075 begun, 0 draws continued one`;
+   die Fortsetzung in `Draw.cpp:1614` hängt an `!gpuIndirect`, und dieser Titel zeichnet
+   indirekt — sie kann konstruktiv nie greifen).
 
-**2. Die Übersetzungssteuer, der größte Posten.** 85 SPIR-V-Words pro Guest-Instruktion,
-34 % des Codes sind Lane-Maskierung, wave64 wird als 2x wave32 emuliert. Grob ~89.000
-Lane-Zyklen pro Invocation, wo echte Hardware mit einigen Tausend auskäme. Und sie ist
-**von der Codeseite aus nicht reduzierbar**: volle Optimierung bringt 1,4 %, halber Code
-kostet +94 %.
-
-**3. Reiner Emulator-Overhead: ~42 ms von 120 ms.** Zwei Posten, die kein PS5-Spiel
-verursacht:
-
-- **24 ms Image-Round-Trip** (721 MiB pro Present), weil dieselbe Fläche getiledes Image
-  *und* linearer Gast-Buffer ist. Obergrenze gemessen: +48 % fps.
-- **18,4 ms Draws bei 25 Draws pro Present** = 0,74 ms pro Draw. Der Grund steht in der
-  Telemetrie: **`render passes 2075 begun, 0 draws continued one`**. Jeder Draw beginnt
-  seinen **eigenen** Render-Pass auf 4K-DCC-Targets, und jeder Pass lädt und speichert die
-  Attachments. Die Fortsetzungsmechanik ist vorhanden (`Draw.cpp:1614`), kann aber nicht
-  greifen, weil sie an `!gpuIndirect && !readsTarget` hängt — und dieser Titel zeichnet
-  GPU-seitig indirekt (`[indirect] gpu-side 742985`). Ein indirekter Draw braucht seine
-  Argument-Barriere außerhalb des Passes, also wird jeder Pass neu begonnen.
-
-**Die Reihenfolge der Hebel ist damit:** Image-Round-Trip (24 ms, Ursache belegt),
-Render-Pass-pro-Draw (18 ms, Mechanik vorhanden aber gesperrt), dann die
-Übersetzungssteuer (strukturell, teuer zu bewegen).
-
-**Und der Vorbehalt bleibt:** selbst wenn alle drei fallen, erscheint das Menü davon nicht.
-Der Titel verlässt seine Stufe nicht (siehe oben) — fps machen das Warten kürzer, nicht
-das Ziel erreichbar.
+**Die Rechnung dazu, das volle Budget und was 60 fps verlangt, steht in
+[`frame_budget_roadmap.md`](frame_budget_roadmap.md).** Kurz: Stufe 1 (Abfall entfernen)
+bringt rechnerisch 12,3 fps, und selbst wenn *alles* außer den zwei heißen Shadern auf null
+fiele, blieben 47,4 ms = **21 fps**. 60 fps sind ohne Angriff auf die Übersetzungssteuer
+unerreichbar.
 
 ## Zweite Kostenquelle: die ausgeführte Befehlsmenge
 
