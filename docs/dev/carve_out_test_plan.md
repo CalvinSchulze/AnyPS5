@@ -1,5 +1,10 @@
 # Messplan: Carve-out-Staging für adressbasierte Builds
 
+> **Gelaufen am 13.10.** Logs unter `_analytics/carve_out_tests/`, Ergebnis und Urteil im
+> Hauptdokument. Kurz: A/B trägt (66,8 → 27,6 ms, 6,4 → 8,3 fps, CPU-Seite ruhig). Lauf C
+> brach ab und hat damit einen latenten Fehler in `owner()` gefunden, der behoben ist —
+> **Lauf C ist mit dem Fix nachzuholen**, das 4096-KiB-Fenster war nicht die Ursache.
+
 Auftrag für einen Messlauf, nicht für eine Code-Änderung. Was gebaut ist, steht in
 [`immediate_shader_boost.md`](immediate_shader_boost.md) unter *Gebaut: der Carve-out*.
 Ziel ist **eine Zahl pro Zeile der Tabelle unten** und ein Urteil: trägt der Carve-out,

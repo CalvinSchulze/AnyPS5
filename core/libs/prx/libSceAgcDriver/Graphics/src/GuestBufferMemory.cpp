@@ -1993,6 +1993,14 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     };
     const auto* own = candidate(regions);
     const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
+    // A region carved out of a base region (addDescriptorRegion) can begin above the base region
+    // and end at or below the address, which the base region still holds: the ranges of a dispatch
+    // sit back to back, so a carve-out ending exactly where the next element begins would
+    // otherwise be handed out as that element's owner and fail the caller's end check. One that
+    // contains the address therefore wins over one that merely begins below it; where both
+    // contain it (a carve-out inside its base region) the greater begin wins, as before.
+    const auto holds = [address](const Region* region) { return region != nullptr && address < region->end; };
+    if (holds(own) != holds(shared)) return holds(own) ? own : shared;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;
     return own;
 }

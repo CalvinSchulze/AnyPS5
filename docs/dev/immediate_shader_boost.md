@@ -36,21 +36,34 @@ belegt — aber nur für **~60 %** der Kosten, und der Eingriff selbst ist unbra
 (1,2 fps). Zahlen und Vorbehalte unter
 [Eingriffs-Test](#eingriffs-test-ursache-belegt-fix-noch-nicht).
 
-**Erster Schritt: gebaut, noch nicht gemessen.** Der Riegel war weder die Device-Adresse
-noch das Write-Bit, sondern `addDescriptorRegion`: für einen adressbasierten Build ist die
-ganze Arena *eine* Basis-Region, jedes V#-Element liegt `Inside`, also entstand gar keine
-Region, die das Staging hätte sehen können. Der **Carve-out** löst genau das, mit A/B über
-`APS5_NO_ADDRESSABLE_STAGING=1` — siehe
-[Carve-out](#gebaut-der-carve-out-riegel-war-die-basis-region-nicht-das-write-bit).
-Nächster Schritt ist der Messlauf, Plan in
-[`carve_out_test_plan.md`](carve_out_test_plan.md).
+**Der Fix steht und ist gemessen.** Der Riegel war weder die Device-Adresse noch das
+Write-Bit, sondern `addDescriptorRegion`: für einen adressbasierten Build ist die ganze
+Arena *eine* Basis-Region, jedes V#-Element liegt `Inside`, also entstand gar keine Region,
+die das Staging hätte sehen können. Der **Carve-out** löst das und bringt den Flaschenhals
+von 66,8 auf **27,6 ms** pro Dispatch und die Szene von 6,4 auf **8,3 fps**, bei 2,34 ms
+Kopien pro Present und ruhiger CPU-Seite — siehe
+[Carve-out](#der-carve-out-trägt-gemessen-24x-und-30--fps).
 
-**Zweite offene Front:** nach dem Eingriff bleiben 27,6 ms pro Dispatch = 3,33 ms pro
-Mio. Invocations, immer noch 50–250x über den billigen 4K-Pässen. Da sitzt eine
-**zweite, unabhängige Kostenquelle**. Hauptverdächtiger ist jetzt der
-**Lookup pro Zugriff** — eine nicht inlinebare Binärsuche über die Range-Tabelle, plus
-Device-Scope-Atomics pro Store; gelesen, nicht gemessen, mit Messplan unter
-[zweite Kostenquelle](#verdacht-auf-die-zweite-kostenquelle-der-lookup-pro-zugriff).
+**Drei Dinge als nächstes, in dieser Reihenfolge:**
+
+1. **Lauf C nachholen.** Er brach bei `SWEPT_SHADOW_MAX_KIB=4096` ab und hat damit einen
+   latenten Fehler in `owner()` gefunden, der jetzt behoben ist. Das kleinere Fenster ist
+   **nicht** das Problem gewesen, siehe [Lauf C](#lauf-c-hat-einen-latenten-fehler-gefunden-nicht-eine-fenstergrenze).
+2. **`0x80003e8700`** (20 % GPU-Last) rührt sich unter dem Carve-out nicht, fällt unter
+   `NO_HOST_IMPORT` aber um 6,4x. Zwei Kandidaten, einer davon ein **Read-only-Carve-out**,
+   der billiger wäre als der geschriebene Fall:
+   [offene Front](#offen-0x80003e8700-rührt-sich-nicht).
+3. **Die zweite Kostenquelle** ist jetzt sauber eingekreist: 27,6 ms *mit* device-lokalen
+   Puffern sind nachweislich kein PCIe mehr.
+
+**Zweite offene Front, jetzt zweifach bestätigt:** 27,6 ms pro Dispatch = 3,33 ms pro
+Mio. Invocations bleiben übrig, immer noch 50–250x über den billigen 4K-Pässen — und das
+in **zwei unabhängigen Läufen** (ganze Arena gespiegelt, und jetzt die vier Elemente
+device-lokal gestagt). Die Buffer liegen im Device-Speicher, PCIe ist als Erklärung dieses
+Restes damit raus. Hauptverdächtiger ist der **Lookup pro Zugriff** — eine nicht
+inlinebare Binärsuche über die Range-Tabelle, plus Device-Scope-Atomics pro Store;
+gelesen, nicht gemessen, mit Messplan unter
+[zweite Kostenquelle](#zweite-kostenquelle-verdacht-auf-den-lookup-pro-zugriff).
 
 **Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
 
@@ -369,78 +382,102 @@ Taktzustände, Cache-Residenz und fehlende Parallelarbeit unterscheiden sich dam
 der Basislinie; die Richtung und die Selektivität der Signatur sind überzeugend, die
 genauen Faktoren 2,4x und 6,4x sind weich.
 
-### Gebaut: der Carve-out (Riegel war die Basis-Region, nicht das Write-Bit)
+### Der Carve-out trägt: gemessen, 2,4x und +30 % fps
 
-Gebraucht wird device-lokale Ablage **nur für die Ranges, die der heiße Shader wirklich
-anfasst** — nicht für die ganze Arena. Genau das tut das Written-Shadow-Staging, und es
-war für adressierbare Builds gesperrt.
-
-Zwei Verdächtige fielen beim Lesen des Codes weg, bevor der echte Riegel auftauchte:
-
-- **Die Device-Adresse ist es nicht.** `addressRange` (`:2880`) veröffentlicht längst
-  `region.buffer->DeviceAddress()`, und `gpuCopyUsage(addressable)` hängt dem
-  Staging-Puffer `SHADER_DEVICE_ADDRESS_BIT` an. Der Kommentar „AddressRanges needs a
-  device address" trug nicht mehr.
-- **Das Write-Bit ist es auch nicht.** `addressRange` setzt `Write` nur für
-  `region.direct != nullptr`, aber die Aufteilung am Ende von `AddressRanges()` (`:2911`)
-  schneidet jede Range ohne `Write` an den `writes`-Intervallen und vergibt das Bit dort
-  mit der *gestagten* Adresse. Eine gestagte, geschriebene Region bekommt es also
-  ohnehin.
-
-**Der Riegel war `addDescriptorRegion`:**
+Gebraucht wurde device-lokale Ablage **nur für die Ranges, die der heiße Shader wirklich
+anfasst**. Zwei Verdächtige fielen beim Lesen weg, bevor der echte Riegel auftauchte:
+die **Device-Adresse** nicht (`addressRange` veröffentlicht `region.buffer->DeviceAddress()`
+längst, und `gpuCopyUsage(addressable)` hängt `SHADER_DEVICE_ADDRESS_BIT` an), das
+**Write-Bit** auch nicht (die Aufteilung in `AddressRanges()` vergibt es an den
+`writes`-Intervallen mit der gestagten Adresse). Der Riegel war `addDescriptorRegion`:
 
 ```cpp
-switch (baseOverlap(begin, end, nullptr)) {
-    case BaseOverlap::Inside:
-        return;              // die Basis-Region bedient die Range
+case BaseOverlap::Inside:
+    return;              // die Basis-Region bedient die Range
 ```
 
-Für einen adressbasierten Build ist die ganze 3416-MiB-Arena **eine Basis-Region** des
-Address Space. Jedes der zwölf V#-Elemente liegt darin, also `Inside`, also wird
-**überhaupt keine Region angelegt** — `stagingEligible` sieht diese Buffer nie, egal was
-in ihm steht. Das erklärt die acht kleinen Regionen aus dem R5-Trace restlos: das waren
-genau die, die *außerhalb* einer Basis-Region lagen.
+Für einen adressbasierten Build ist die ganze 3416-MiB-Arena **eine** Basis-Region. Jedes
+V#-Element liegt `Inside`, also entstand **gar keine Region**, die das Staging hätte sehen
+können — das erklärt die acht kleinen Regionen aus dem R5-Trace restlos.
 
-**Was gebaut ist** (Build grün, Laufzeit noch nicht gemessen):
+**Gebaut:** ein gefegtes geschriebenes Element wird aus der Basis-Region herausgeschnitten
+(`carvedOut`), `stagingEligible` lässt genau diese Carve-outs bei adressierbaren Builds
+durch, `AddressRanges()` **subtrahiert** die Spanne aus den Basis-Ranges (der Lookup ist
+eine Binärsuche und braucht aufsteigende, überlappungsfreie Einträge — `requireTableOrder`
+prüft das jetzt), und die Sweep-Erkennung trägt die Thread-Zahl von `Dispatch.cpp` über
+`PrepareDispatch` bis `addGuestBuffer`, wo `threads * stride * 2 >= bytes` entscheidet.
 
-1. `addDescriptorRegion` legt für ein **gefegtes** geschriebenes Element doch eine Region
-   an und markiert sie `carvedOut`, statt sie der Basis-Region zu überlassen.
-2. `stagingEligible` lässt bei adressierbaren Builds genau diese Carve-outs durch
-   (`addressable && !region.carvedOut` sperrt weiter alles andere) und gibt gefegten
-   Regionen das größere Fenster (16 MiB, `APS5_SWEPT_SHADOW_MAX_KIB`).
-3. `AddressRanges()` **subtrahiert** die Carve-out-Spannen aus den Basis-Ranges. Das ist
-   nicht Kosmetik: der emittierte Lookup ist eine Binärsuche, die aufsteigende,
-   überlappungsfreie Einträge braucht. Zwei Einträge über dasselbe Gast-Byte würden nach
-   Position statt nach Absicht gewählt. `requireTableOrder` prüft die Invariante jetzt
-   pro Tabelle, statt sie zu unterstellen.
-4. Die Sweep-Erkennung: `Dispatch.cpp` rechnet die Thread-Zahl (Gruppen x Workgroup) aus,
-   `PrepareDispatch` und der `ShaderResources`-Konstruktor tragen sie, und
-   `addGuestBuffer` nennt ein Element gefegt, wenn `threads * stride * 2 >= bytes`.
-   Indirekte Dispatches (Gruppen erst auf der GPU) und Raw-Buffer (Stride 0) sind nie
-   gefegt.
+**Messung** (A/B aus einem Binary, Logs unter `_analytics/carve_out_tests/`):
 
-Für den Flaschenhals passt das Kriterium ohne Spielraum: Buffer 4 hat 2 B Stride und
-8.294.400 Records bei 8.294.400 Threads, Buffer 10 hat 1 B Stride und 8.165.312 Records
-— beide zu 100 % gefegt, beide innerhalb 16 MiB. Buffer 7 und 9 (4 B, 4,1 MB) ebenfalls.
+| | A: `NO_ADDRESSABLE_STAGING=1` | B: Carve-out |
+|---|---|---|
+| `0x800038be00` pro Dispatch | 66,8 ms | **27,6 ms** (2,42x) |
+| `0x80003e8700` pro Dispatch | 19,9 ms | 19,8 ms (unverändert) |
+| Presents / 10 s | 64 (~6,4 fps) | **83 (~8,3 fps)**, +30 % |
+| GPU busy / idle gaps | 140,2 / 17,1 ms | 102,7 / 17,3 ms |
+| gestagte Regionen | 192 (nur ≤ 640 KiB) | 1.743, inkl. 16,2 / 8,0 / 2x 4,1 MB |
+| Staging-Kopien pro Present | ~0,09 ms | **~2,34 ms** (1,20 in + 1,14 out) |
+| `mirror prepare` pro Build | 0 us | **0 us** |
+| `[bda-table]` hits / misses | 631 / 189 | 664 / 415 |
 
-**A/B in einem Build:** `APS5_NO_ADDRESSABLE_STAGING=1` schaltet den Carve-out ab und
-stellt das alte Verhalten her. Das ist der Vergleich, der die Hypothese prüft.
+Der Flaschenhals landet damit **genau auf dem Niveau des `NO_HOST_IMPORT`-Laufs** (27,6 ms)
+— aber ohne dessen Preis: 2,34 ms Kopien pro Present statt 44 ms Mirror-Vorbereitung pro
+Build, CPU-Seite ruhig, keine Faults, keine Tabellen-Überlappung, kein verlorener
+Copy-back. Die Gegenrechnung, an der der Eingriffs-Test gestorben ist, geht diesmal auf.
 
-**Offen und zu messen, nicht zu glauben:**
+### Lauf C hat einen latenten Fehler gefunden, nicht eine Fenstergrenze
 
-- Ob die zwei Bulk-Kopien pro Dispatch (Copy-in und Copy-back, ~33 MB) billiger sind als
-  die PCIe-Zugriffe, die sie ersetzen. Der `NO_HOST_IMPORT`-Lauf sagt, dass die Zugriffe
-  ~39 ms wert sind; die Kopien sollten device-lokal bei wenigen ms liegen.
-- Die **CPU-Seite**: mit Carve-outs ist `regions` nicht mehr leer, also greift
-  `CachedAddressTable` nicht und jeder adressbasierte Build baut die Tabelle neu
-  (856 Ranges plus Subtraktion). Sichtbar in `[address] us per build` und `[bda-table]`.
-  Das ist genau der Weg, auf dem `NO_HOST_IMPORT` gescheitert ist — nur viel kleiner.
-- Ob `requireTableOrder` anspringt. Es darf nicht, aber wenn doch, ist das ein Fund.
+`APS5_SWEPT_SHADOW_MAX_KIB=4096` brach reproduzierbar nach 14 s ab:
 
-## Verdacht auf die zweite Kostenquelle: der Lookup pro Zugriff
+```
+compute shader 0x800038be00: AGC graphics: guest buffer view exceeds its GPU owner
+```
 
-Noch nicht gemessen, aber aus dem Emitter gelesen und passend zu allem, was die Tabelle
-oben zeigt. Jeder BDA-Zugriff ruft `get_bda_pointer` (`SpirvBdaLookup.cpp:21`), und diese
+Mit `APS5_NO_ADDRESSABLE_STAGING=1` lief dasselbe Fenster stabil. **Das heißt nicht, dass
+16 MiB nötig sind** — es heißt, dass ein *teilweiser* Carve-out einen Fehler in
+`owner()` freilegt, der bei 16 MiB nur nicht getroffen wurde:
+
+Bei 4096 KiB bleiben die 16,2-MB- und die 8,0-MB-Range in der Arena, während die beiden
+4050-KiB-Ranges und einige kleine herausgeschnitten werden. `owner()` gab „die Region mit
+dem größten `begin` unterhalb der Adresse" zurück und überließ die Endprüfung dem Aufrufer.
+Die Elemente eines Dispatches liegen aber **Stoß an Stoß**: der Carve-out
+`0x500a743200+0x1fa40` endet auf `0x500a762c40` — genau der Basis des nicht gecarvten
+8-MB-Buffers. Für dessen Adresse lieferte `owner()` also den Carve-out statt der Arena,
+und die Bounds-Prüfung in `Descriptor()` schlug fehl.
+
+**Behoben:** eine Region, die die Adresse **enthält**, gewinnt jetzt gegen eine, die nur
+darunter beginnt; enthalten beide (ein Carve-out in seiner Basis-Region), gewinnt wie
+bisher das größere `begin`. Das betrifft auch die vier Write-Back-Pfade, die über
+`owner(begin)` gehen. Regressionstest in `tests/BdaResources.cpp`: ein gefegtes Element,
+ein nicht gefegtes direkt dahinter, und die Prüfung, dass die Tabelle disjunkt bleibt.
+
+Lauf C ist damit **nachzuholen** — mit dem Fix sollte das kleinere Fenster nur weniger
+Ranges stagen, nicht abbrechen.
+
+### Offen: `0x80003e8700` rührt sich nicht
+
+Der zweite Shader (20 % GPU-Last) fällt unter `NO_HOST_IMPORT` um **6,4x** auf 3,0 ms,
+unter dem Carve-out aber **gar nicht** (19,9 → 19,8 ms). Seine Kosten sind also ebenfalls
+PCIe-In-place-Zugriff, aber keines seiner drei Elemente wird gecarvt. Zwei Kandidaten,
+beide in einem Lauf zu trennen:
+
+1. **Seine Elemente werden nicht geschrieben.** Das Written-Shadow-Staging verlangt
+   `WritesOverlap`, ein nur *gelesenes* Element in einem Host-Import kann es nicht
+   erreichen — obwohl es pro Zugriff genauso über PCIe geht. Gegenprobe:
+   `APS5_ALL_BUFFERS_WRITTEN=1`. Fällt der Shader damit, ist es das, und die Richtung ist
+   ein **Read-only-Carve-out**: nur Copy-in, kein Copy-back, also billiger als der
+   geschriebene Fall.
+2. **Die Sweep-Schwelle greift nicht.** 2.073.600 Threads bei `8x8x1`; wenn Stride x
+   Threads weniger als die Hälfte des Elements deckt, ist es nicht gefegt. Sichtbar im
+   `[staging]`-Trace: fehlen seine Ranges dort ganz, ist Kandidat 1 dran; erscheinen sie
+   nicht, obwohl sie geschrieben werden, Kandidat 2.
+
+## Zweite Kostenquelle: Verdacht auf den Lookup pro Zugriff
+
+Jetzt die Hauptfront. Dass der Rest **nicht** PCIe ist, steht nach dem Carve-out fest:
+derselbe Shader kostet 27,6 ms, obwohl seine vier großen Elemente device-lokal liegen.
+Der Verdacht ist aus dem Emitter gelesen, nicht gemessen, passt aber zu allem, was die
+Tabelle oben zeigt. Jeder BDA-Zugriff ruft `get_bda_pointer` (`SpirvBdaLookup.cpp:21`), und diese
 Funktion ist
 
 - mit `FunctionControlDontInlineMask` deklariert — der Treiber kann sie nicht inlinen,
