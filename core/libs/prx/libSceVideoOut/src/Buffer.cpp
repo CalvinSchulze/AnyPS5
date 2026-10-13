@@ -1,4 +1,7 @@
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -8,6 +11,50 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+
+namespace {
+
+// APS5_TRACE_FLIP=1 reports every five seconds which buffer indices the title flips and, for a
+// real buffer, how many of a sample of its guest bytes are non-zero. Two questions the dumps of
+// the *presented* frame cannot separate: index -2 (BLACK) and -1 (BLANK) are black by definition,
+// so a title flipping those produces a black screen on purpose; and a real buffer full of zeros
+// means the title drew nothing, while a non-zero one that still presents black means we lose the
+// picture on the way. Read-only, every 128th byte of the first 2 MiB.
+std::atomic<std::uint64_t> g_flipReal{0};
+std::atomic<std::uint64_t> g_flipBlack{0};
+std::atomic<std::uint64_t> g_flipBlank{0};
+std::atomic<std::uint64_t> g_flipNonZero{0};
+std::atomic<std::uint64_t> g_flipSampled{0};
+std::atomic<std::int64_t> g_flipReported{0};
+
+void NoteFlip(int index, std::uint64_t address) {
+    static const bool trace = std::getenv("APS5_TRACE_FLIP") != nullptr;
+    if (!trace) return;
+    if (index == VIDEO_OUT_BUFFER_INDEX_BLACK) g_flipBlack.fetch_add(1, std::memory_order_relaxed);
+    else if (index == VIDEO_OUT_BUFFER_INDEX_BLANK) g_flipBlank.fetch_add(1, std::memory_order_relaxed);
+    else {
+        g_flipReal.fetch_add(1, std::memory_order_relaxed);
+        if (address != 0) {
+            std::uint64_t nonZero = 0;
+            const auto* bytes = reinterpret_cast<const volatile unsigned char*>(address);
+            for (std::size_t offset = 0; offset < (2u << 20u); offset += 128) {
+                if (bytes[offset] != 0) ++nonZero;
+            }
+            g_flipNonZero.fetch_add(nonZero, std::memory_order_relaxed);
+            g_flipSampled.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto reported = g_flipReported.load(std::memory_order_relaxed);
+    if (reported != 0 && now - reported < 5000) return;
+    if (!g_flipReported.compare_exchange_strong(reported, now)) return;
+    const auto sampled = g_flipSampled.load();
+    std::fprintf(stderr, "[flip] %llu real, %llu black, %llu blank; %llu of 16384 sampled bytes non-zero over %llu sampled flips\n",
+        static_cast<unsigned long long>(g_flipReal.load()), static_cast<unsigned long long>(g_flipBlack.load()), static_cast<unsigned long long>(g_flipBlank.load()),
+        static_cast<unsigned long long>(sampled == 0 ? 0 : g_flipNonZero.load() / sampled), static_cast<unsigned long long>(sampled));
+}
+
+}
 
 AgcDriver::DisplayBuffer DescribeVideoOutBuffer(const VideoOutBuffer& buffer, const BufferAttributeGroup& group) {
     const auto& attribute = group.attribute;
@@ -194,6 +241,7 @@ int APS5_VABI sceVideoOutSubmitFlip(int handle, int index, int flipMode, int64_t
     if (!special && !cfg->buffers[index].Occupied()) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_INDEX");
     }
+    NoteFlip(index, special ? 0 : cfg->buffers[index].dataAddress);
     lock.unlock();
     return VideoOutDriver::Get().SubmitFlip(handle, index, flipMode, flipArg);
 } catch (const ProcessShutdown&) {
