@@ -101,6 +101,24 @@ die **Render-Targets** hat niemand angesehen.
 **Falle vorweg:** die `[videodec2] Decode`-Zeile ist im Code auf die **ersten drei**
 Dekodierungen begrenzt (`decoder.decoded < 3`). Drei Zeilen heißen **nicht** drei Frames.
 
+### Dazu eine Frage zur Bildrate, aus demselben Lauf
+
+Von außen beobachtet laufen die **Intro-Animationen flüssig**, geschätzt Richtung 60, mit
+synchronem Ton ohne Ruckler. Unsere Telemetrie zeigt dagegen über **58 Fenster** eines
+600-s-Laufs durchgehend **71 bis 92 Presents pro 10 s**, also 7–9 fps, und in keinem
+einzigen Fenster mehr.
+
+**Zu berichten, rein als Zahlenreihe:**
+
+4. Die Presents pro 10-s-Fenster aus diesem Lauf, in Reihenfolge, als Liste
+   (aus den `[gputime] ... ; N presents;`-Teilen).
+5. Dazu aus der `[packets]`-Zeile die Zahl der `flip`-Pakete pro Fenster, ebenfalls als
+   Liste in Reihenfolge.
+6. Und die Nummer des **ersten** `frame_*.bmp`, dessen Max-Wert in einem Kanal von 0
+   verschieden ist — falls es keinen gibt, genau das schreiben.
+
+Keine Zuordnung zu Phasen, keine Deutung. Die drei Listen nebeneinander genügen.
+
 ## Was nicht zu tun ist
 
 - **Nicht** interpretieren.

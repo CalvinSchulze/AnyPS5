@@ -6,6 +6,19 @@ gehen**, was davon holbar ist und was 60 fps rechnerisch verlangt. Alle Zahlen g
 Grundlage ist Lauf B aus `_analytics/carve_out_tests/run_B_carveout.log` (83 Presents / 10 s,
 RTX 5080, leere Szene hinter dem Ladekreisel).
 
+## Vorbehalt zur Messgrundlage
+
+Die Zahlen unten stammen aus der **3D-Phase** (leere Szene hinter dem Ladekreisel). Von
+außen beobachtet laufen die **Intro-Animationen davor flüssig**, Richtung 60, mit
+synchronem Ton — unsere Telemetrie zeigt aber über **58 Fenster** eines 600-s-Laufs
+durchgehend nur 71–92 Presents pro 10 s. Entweder läuft das Intro also auch bei ~9 fps und
+wirkt durch Video und synchronen Ton flüssiger als es ist, oder es erreicht den Schirm über
+einen Pfad, den unser Zähler nicht sieht (`presents` wird am Blit hochgezählt,
+`VulkanDevice.cpp:2516`).
+
+**Für dieses Budget ist das ohne Folgen** — es beschreibt die 3D-Phase, und die ist das
+Ziel. Aber wer „8,3 fps" zitiert, meint die 3D-Phase, nicht die Sitzung.
+
 ## Der Abstand
 
 **120 ms pro Frame heute, 16,7 ms für 60 fps — Faktor 7,2.**
