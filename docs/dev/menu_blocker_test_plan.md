@@ -1,4 +1,4 @@
-# Messplan: was der Titel nach dem Intro-Film noch tut
+# Messplan: flippt der Titel ein Bild, und ist es leer?
 
 ## Regel für diesen Auftrag: **nicht interpretieren**
 
@@ -9,33 +9,45 @@ zitieren mit Zeilennummer, zählen, tabellieren. Eine Beobachtung, die nicht zur
 
 ## Was die letzte Runde ergeben hat
 
-Der korrigierte Lesezähler zeigt: **der Titel liest** (AIO lief am alten Zähler vorbei).
+**`[sysevent]`: 0 Aufrufe.** Der Titel pollt `sceSystemServiceReceiveEvent` nie — die
+System-Event-Pumpe ist kein Gate. Erledigt.
+
+**Der Film endet nicht, er bleibt stehen.** Diesmal:
 
 ```
-4054: 101 read calls, 6.0 MiB      4065: 1 decode calls, 0 pictures out, last 0x0
-4437: 361 read calls, 6.8 MiB      4447: 42 decode calls, 40 pictures out, last 1920x1080
-4518: 594 read calls, 7.5 MiB      4524: 80 decode calls, 78 pictures out
-4539: 829 read calls, 8.2 MiB      4556: 116 decode calls, 114 pictures out
-4619: 1064 read calls, 8.9 MiB     4625: 152 decode calls, 150 pictures out, last 1920x1080
+4056:   1 decode calls,   0 pictures out, 0 flushes, 0 deletes, last 0x0
+4447: 152 decode calls, 150 pictures out, 0 flushes, 0 deletes, last 1920x1080
+4564: 304 decode calls, 302 pictures out, 0 flushes, 0 deletes
+4609: 457 decode calls, 455 pictures out, 0 flushes, 0 deletes, last 1920x1080
 ```
 
-**Der Decoder arbeitet** — 150 von 152 Aufrufen geben ein Bild bei 1920x1080 zurück. Und
-**beide Reihen enden gleichzeitig** (Zeile 4619 und 4625); danach kommen ~3075 Logzeilen
-ohne einen einzigen Lese- oder Dekodiervorgang, während die GPU weiterläuft
-(`[gpu] 3000 → 3700 dispatches`).
+Danach 3467 Zeilen ohne Dekodierung. Im Lauf davor waren es **152** Bilder, jetzt **455** —
+die Zahl ist also **nicht** fest, und `flushes` wie `deletes` bleiben **0**. Der Titel baut
+den Decoder nie ab. Die frühere Lesart „ein 5-Sekunden-Clip läuft zu Ende" ist damit
+widerlegt: die Wiedergabe **stockt** an wechselnder Stelle.
 
-Aus dem Code dazu ausgeschlossen: **AIO hängt nicht** (`Aio.cpp` führt jede Anfrage
-synchron aus und setzt `AioCompleted`), und **Flip/Vblank-Events werden geliefert**
-(`triggerEvents` pro Vblank). Weiterhin offen: `APS5_DUMP_TARGETS` erzeugt **0** Dateien,
-auch im richtigen Verzeichnis.
+**Woran das die Frage hängt:** eine Film-Pipeline, die ohne Abbau stehenbleibt, hängt
+typischerweise an der **Ausgabeseite** — die dekodierten Bilder werden nicht abgeholt, die
+Warteschlange füllt sich, der Titel schickt nichts mehr hinein. Und genau dort haben wir
+eine Lücke: die präsentierten Frames sind schwarz, und `APS5_DUMP_TARGETS` schreibt 0
+Dateien.
 
-**Die Frage dieser Runde:** 150 Bilder sind bei 30 fps ein 5-Sekunden-Clip. Baut der Titel
-den Film danach ordentlich ab, und was pollt er, während er wartet?
+## Was neu im Build ist
 
-## Bauen und Deployen: ja, nötig — **zwei** Module
+`APS5_TRACE_FLIP=1` meldet alle fünf Sekunden eine `[flip]`-Zeile mit:
+
+- wie viele Flips auf **echte** Puffer gingen, wie viele auf die Sonderindizes **BLACK**
+  (−2) und **BLANK** (−1) — die sind per Definition schwarz,
+- und wie viele von 16384 gelesenen Bytes eines echten Puffers **nicht null** waren
+  (jedes 128. Byte der ersten 2 MiB, rein lesend).
+
+Damit lassen sich zwei Dinge trennen, die der Frame-Dump zusammenwirft: ob der Titel
+überhaupt ein Bild zum Flippen gibt, und ob dieses Bild leer ist.
+
+## Bauen und Deployen: ja, nötig — **ein** Modul
 
 ```
-ninja -C "I:\Emulation\PS5 Emu\Software\AnyPS5\build" core/libs/libs/libSceVideodec2.prx core/libs/libs/libSceSystemService.prx
+ninja -C "I:\Emulation\PS5 Emu\Software\AnyPS5\build" core/libs/libs/libSceVideoOut.prx
 ```
 
 Toolchain-`bin` in den `PATH`:
@@ -44,55 +56,39 @@ Toolchain-`bin` in den `PATH`:
 C:\Users\CptWhuti\AppData\Local\Temp\claude\I--Emulation-PS5-Emu-Software-AnyPS5\685ea80c-0bfb-4ab4-b237-3f3880416715\scratchpad\mingw64\bin
 ```
 
-**Deployen**, beide Dateien je dreifach:
+**Deployen**, dreifach:
 
 ```
-build\core\libs\libs\libSceVideodec2.prx     ->  Z:\GhostOfYotei\libSceVideodec2.prx
-                                                 Z:\GhostOfYotei\libs\libSceVideodec2.prx
-                                                 Z:\GhostOfYotei\libs\libs\libSceVideodec2.prx
-build\core\libs\libs\libSceSystemService.prx ->  Z:\GhostOfYotei\libSceSystemService.prx
-                                                 Z:\GhostOfYotei\libs\libSceSystemService.prx
-                                                 Z:\GhostOfYotei\libs\libs\libSceSystemService.prx
+build\core\libs\libs\libSceVideoOut.prx  ->  Z:\GhostOfYotei\libSceVideoOut.prx
+                                             Z:\GhostOfYotei\libs\libSceVideoOut.prx
+                                             Z:\GhostOfYotei\libs\libs\libSceVideoOut.prx
 ```
 
 **Marker, dass es greift:**
 
-> Mindestens eine Zeile `[videodec2] ... flushes, ... deletes, last ...` **und** mindestens
-> eine Zeile `[sysevent] ... receive calls`. Fehlt eines von beiden: **abbrechen und melden**,
-> mit Angabe welches.
+> Mindestens eine `[flip]`-Zeile im Log. Fehlt sie: **abbrechen und melden**.
 
-## Lauf 1 — Film-Abbau und Event-Pumpe
+## Lauf 1 — Flips und Bildinhalt
 
 ```
-APS5_TRACE_VIDEODEC=1 APS5_TRACE_SYSTEMEVENT=1 .pp.exe
+APS5_TRACE_FLIP=1 APS5_TRACE_VIDEODEC=1 .pp.exe
 ```
 
-**Vier Minuten.** Beide Zeilenarten kommen höchstens alle fünf Sekunden.
-
-Die `[videodec2]`-Fortschrittszeile trägt jetzt zusätzlich `flushes` und `deletes` (Aufrufe
-von `sceVideodec2Flush` und `sceVideodec2DeleteDecoder`). `[sysevent]` zählt die Aufrufe von
-`sceSystemServiceReceiveEvent`, das im Code **unbedingt `NO_EVENT`** zurückgibt.
+**Vier Minuten.**
 
 **Zu berichten:**
 
-1. **Alle** `[videodec2] ... decode calls ...`-Zeilen wörtlich mit Zeilennummer.
-2. **Alle** `[sysevent]`-Zeilen wörtlich mit Zeilennummer.
-3. Für jede der beiden Arten: die Zeilennummer der **letzten** Zeile und wie viele Logzeilen
-   danach noch folgen.
-4. Laufen die `[sysevent]`-Zahlen nach dem Ende der `[videodec2]`-Zeilen **weiter**? Nur die
-   Zahlen, keine Deutung.
-
-## Lauf 2 — nur falls Lauf 1 ohne `[sysevent]`-Zeilen bleibt
-
-Dann pollt der Titel die Event-Pumpe nicht, und die Frage verschiebt sich. In diesem Fall
-**keinen** weiteren Lauf starten, sondern melden — der nächste Schritt ist dann eine
-Codeänderung, keine Messung.
+1. **Alle** `[flip]`-Zeilen wörtlich mit Zeilennummer, in Reihenfolge.
+2. **Alle** `[videodec2] ... decode calls ...`-Zeilen wörtlich mit Zeilennummer.
+3. Die Zeilennummer der letzten Zeile jeder Art und wie viele Logzeilen danach folgen.
+4. Laufen die `[flip]`-Zahlen weiter, nachdem die `[videodec2]`-Zeilen aufgehört haben?
+   Nur die Zahlen.
 
 ## Was nicht zu tun ist
 
 - **Nicht** interpretieren.
-- **Nicht** erneut Hang-Dumps, Sampler, `WATCH_ADDR`, `DUMP_GUEST`, Frame-Dumps oder
-  `TRACE_FILEIO` fahren — alle sind durch.
+- **Nicht** erneut Hang-Dumps, Sampler, `WATCH_ADDR`, `DUMP_GUEST`, Frame-Dumps,
+  `DUMP_TARGETS`, `TRACE_FILEIO` oder `TRACE_SYSTEMEVENT` fahren — alle sind durch.
 - **Nicht** an fps arbeiten.
 - **Keinen** Code ändern.
 

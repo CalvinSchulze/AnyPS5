@@ -20,30 +20,27 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: der Intro-Film läuft durch, danach hört alles auf
+## Vorrang: die Filmwiedergabe stockt, und zwar an wechselnder Stelle
 
-> **Der Moment ist lokalisiert.** Der korrigierte Lesezähler zeigt, dass der Titel liest
-> (AIO lief am alten Zähler vorbei): 1064 Leseaufrufe, 8,9 MiB. Und der **Decoder arbeitet**
-> — 150 von 152 Aufrufen geben ein Bild bei **1920x1080** zurück. Beide Reihen enden
-> **gleichzeitig** (Logzeile 4619 und 4625), danach ~3075 Zeilen ohne einen einzigen Lese-
-> oder Dekodiervorgang, während die GPU weiterläuft (`[gpu] 3000 → 3700 dispatches`).
+> **Korrektur der letzten Lesart.** „Ein 5-Sekunden-Clip läuft zu Ende" war falsch. Der
+> nächste Lauf zeigt **457 Dekodier-Aufrufe und 455 Bilder** statt 152/150 — die Zahl ist
+> nicht fest. Und `flushes` wie `deletes` bleiben **0**: der Titel baut den Decoder **nie**
+> ab. Die Wiedergabe **stockt** also, sie endet nicht.
 >
-> 150 Bilder sind bei 30 fps ein **5-Sekunden-Clip** — der Intro-Film läuft also
-> wahrscheinlich bis zum Ende, und *danach* beginnt nichts Neues mehr.
+> **Erledigt:** `sceSystemServiceReceiveEvent` wird **nie** aufgerufen (`[sysevent]` = 0),
+> die System-Event-Pumpe ist kein Gate. Dazu aus dem Code: AIO ist synchron und kann nicht
+> hängen, Flip- und Vblank-Events werden geliefert, der Decoder liefert Bilder bei 1920x1080.
 >
-> **Aus dem Code ausgeschlossen, nicht geraten:** AIO hängt nicht (`Aio.cpp` führt jede
-> Anfrage synchron aus und setzt `AioCompleted`), Flip- und Vblank-Events werden geliefert
-> (`triggerEvents` pro Vblank), der Decoder liefert Bilder. Dazu alles aus den Runden davor:
-> Deadlock, Fences, HLE-Threads, Savedata, PlayGo, Registerdruck, Codemenge.
+> **Wohin das zeigt:** eine Film-Pipeline, die ohne Abbau stehenbleibt, hängt an der
+> **Ausgabeseite** — die dekodierten Bilder werden nicht abgeholt, die Warteschlange füllt
+> sich, der Titel schickt nichts mehr nach. Und genau dort ist unsere Lücke: präsentierte
+> Frames schwarz, `APS5_DUMP_TARGETS` schreibt 0 Dateien.
 >
-> **Gefunden, aber noch nicht als Ursache belegt:** `sceSystemServiceReceiveEvent` gibt
-> **unbedingt `NO_EVENT`** zurück (`libSceSystemService/Export.cpp:107`). Ein Titel, der auf
-> ein Systemereignis wartet, wartet damit für immer. Ob dieser Titel die Pumpe überhaupt
-> benutzt, zählt jetzt `APS5_TRACE_SYSTEMEVENT`; dazu zählt die `[videodec2]`-Zeile die
-> `Flush`- und `Delete`-Aufrufe, also ob der Film ordentlich abgebaut wird.
->
-> **Weiter offen:** 30 präsentierte Frames schwarz, und `APS5_DUMP_TARGETS` erzeugt 0
-> Dateien auch im richtigen Verzeichnis — die Render-Targets hat niemand gesehen.
+> **Neu gebaut:** `APS5_TRACE_FLIP=1` trennt die zwei Fragen, die der Frame-Dump
+> zusammenwirft — ob der Titel **echte** Puffer flippt oder die Sonderindizes BLACK (−2) und
+> BLANK (−1), die per Definition schwarz sind, und ob ein echter Puffer im Gastspeicher
+> **nicht null** ist. Ist er nicht null und präsentieren wir trotzdem schwarz, verlieren wir
+> das Bild; ist er null, hat der Titel nichts gezeichnet.
 >
 > Auftrag: [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md). Die fps-Operation unten
 > bleibt pausiert, Prognose in [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
