@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -153,6 +155,23 @@ std::uint64_t nextQueue = 1;
 bool Trace() {
     static const bool trace = std::getenv("APS5_TRACE_VIDEODEC") != nullptr;
     return trace;
+}
+
+// APS5_TRACE_VIDEODEC also reports progress every five seconds: how many decode calls came in
+// and how many of them handed a picture back (OutputInfo::isValid), with the last picture's size.
+// The Decode line above is capped at three calls and says nothing about whether decoding works;
+// width and height are read there *before* the call, so 0x0 on the first lines is the state
+// before the first picture, not a failure.
+std::atomic<std::uint64_t> g_decodeCalls{0};
+std::atomic<std::uint64_t> g_decodePictures{0};
+std::atomic<std::int64_t> g_decodeReported{0};
+
+void NoteDecodeProgress(std::uint32_t width, std::uint32_t height) {
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto reported = g_decodeReported.load(std::memory_order_relaxed);
+    if (reported != 0 && now - reported < 5000) return;
+    if (!g_decodeReported.compare_exchange_strong(reported, now)) return;
+    std::fprintf(stderr, "[videodec2] %llu decode calls, %llu pictures out, last %ux%u\n", static_cast<unsigned long long>(g_decodeCalls.load()), static_cast<unsigned long long>(g_decodePictures.load()), width, height);
 }
 
 std::uint32_t AlignUp(std::uint32_t value, std::uint32_t alignment) {
@@ -369,6 +388,7 @@ int APS5_VABI sceVideodec2Decode_nid_postfix(std::uint64_t handle, const InputDa
     std::lock_guard guard(decoder.mutex);
     if (Trace() && decoder.decoded < 3) std::fprintf(stderr, "[videodec2] Decode input=%llu frame=%llu output=%llu au=%llu pts=%llu size=%ux%u fb=%p/%llu\n", static_cast<unsigned long long>(input->thisSize), static_cast<unsigned long long>(frame ? frame->thisSize : 0), static_cast<unsigned long long>(output->thisSize), static_cast<unsigned long long>(input->auSize), static_cast<unsigned long long>(input->ptsData), decoder.width, decoder.height, frame ? frame->frameBuffer : nullptr, static_cast<unsigned long long>(frame ? frame->frameBufferSize : 0));
     ++decoder.decoded;
+    if (Trace()) g_decodeCalls.fetch_add(1, std::memory_order_relaxed);
     const Picture picture{input->ptsData, input->dtsData, input->attachedData};
     if (decoder.flushing) throw std::runtime_error("Videodec2: reset required after flushing");
     if (!input->auData || input->auSize == 0 || input->auSize > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) throw std::runtime_error("Videodec2: invalid access unit");
@@ -384,6 +404,10 @@ int APS5_VABI sceVideodec2Decode_nid_postfix(std::uint64_t handle, const InputDa
     decoder.inputs.emplace(decoder.nextKey++, picture);
     Send(decoder, packet);
     EmitDecoded(decoder, frame, output);
+    if (Trace()) {
+        if (output->isValid) g_decodePictures.fetch_add(1, std::memory_order_relaxed);
+        NoteDecodeProgress(decoder.width, decoder.height);
+    }
     return 0;
 }
 

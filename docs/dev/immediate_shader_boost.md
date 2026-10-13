@@ -20,42 +20,29 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: fünf Spin-Schleifen auf ein Fence-Array, eine Stufe wird nie verlassen
+## Vorrang: der Titel füttert einen H.264-Decoder, und sonst steht alles
 
-> **Kein Deadlock, kein Fortschritt.** `r15` steigt mit 9,01/s (die Bildrate), der Titel
-> rendert also ordentlich — aber über 600 s entstehen 29 Pipelines, die letzte im **zweiten
-> von 58** Telemetriefenstern, bei 7 Dateizugriffen in 10 s und durchgehend schlafenden
-> JobWorkern. Stationärer Leerlauf.
+> **Ausgeschlossen, mit Zahlen:** Deadlock (`r15` steigt mit der Bildrate), GPU-Fences (alle
+> Slots, auf die gewartet wird, laufen mit — Stride-32 und Stride-8-Dump stimmen überein),
+> HLE-Threads (kein Thread in einem unserer Module), Savedata (3 Aufrufe, alle `SCE_OK`),
+> PlayGo (36 Chunks, alles installiert), Registerdruck, SPIR-V-Optimierung, Codemenge.
 >
-> **Der Sampler-Lauf (320 s, 18.806 Runden) zeigt:** der Hauptthread verbringt **97,4 %**
-> seiner Zeit in **fünf** rdtsc-Spin-Schleifen, die alle auf dasselbe Fence-Array
-> (`[0x14465afe8]` → `0x2000000000`) warten — `0xdf3ec2` 70,5 %, `0x125bc42` 17,1 %,
-> `0xdf4a40` 4,4 %, `0xeb74e0` 2,8 %, `0xdf4060` 2,6 %. Über 15 Blöcke à 20 s ändert sich
-> nichts.
+> **Gemessen, aber nicht beweiskräftig:** „101 Leseaufrufe, 6,0 MiB, danach nichts" über
+> 245 s. Der Zähler saß in `sceKernelPread`, und `Aio.cpp` ruft
+> `NativePositioned_nid_no_patch` **direkt** — AIO lief daran vorbei. Jetzt sitzt er am
+> Engpass; ob der Titel lädt, ist bis dahin **offen**.
 >
-> **Die offene Frage:** der Sampler zeigt, *wo* gewartet wird, nicht *worauf*. Fünf
-> Schleifen auf einem Array mit 32 Byte pro Slot heißt möglicherweise fünf verschiedene
-> Slots — zählt einer nie hoch, wartet das Spiel auf eine Vollzugsmeldung, die nie kommt.
-> Dafür ist `APS5_DUMP_GUEST=<hex>[:<count>[:<stride>]]` neu eingebaut: alle zwei Sekunden
-> die Werte, mit `*` für die, die sich geändert haben. Auftrag:
-> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+> **Die neue Spur:** der Titel erzeugt einen **H.264-Decoder für 1920x1088** und schickt
+> echte Access Units hinein (249250, 13157, 17651 Byte). Ob Bilder herauskommen, war nicht
+> messbar — die `Decode`-Zeile ist auf drei Aufrufe begrenzt und liest Breite und Höhe
+> **vor** dem Dekodieren, weshalb `size=0x0` dort nichts bedeutet. Eine Fortschrittszeile
+> zählt jetzt Aufrufe gegen zurückgegebene Bilder.
 >
-> **Nicht gezeigt, auch wenn es so berichtet wurde:** dass der Titel keine HLE-Funktion
-> pollt. Ein Aufruf unter einer Mikrosekunde, einmal pro Frame, erzeugt bei 2-ms-Sampling
-> über 2.900 Frames null bis ein Sample. Das Fehlen von PRX-Samples beweist nichts.
+> **Weiter offen:** 30 präsentierte Frames, alle schwarz. `APS5_DUMP_TARGETS=12` erzeugte
+> **0** Dateien, Grund unbekannt — die Render-Targets hat damit immer noch niemand gesehen.
 >
-> **Die Phasen, von außen beobachtet:** am Anfang laufen **Animationen mit Bild und Ton** —
-> beides funktioniert. Danach soll die 3D-Szene laden, und **dort** bleibt es: Ladekreisel,
-> schwarze Frames, kein Ton. Der Übergang zwischen beidem ist die Stelle. Der Ton beweist
-> also **nicht**, dass im hängenden Zustand Inhalt entsteht; er gehört zur Phase davor.
->
-> Offen bleibt, ob im hängenden Zustand wirklich nichts entsteht oder ein Bild auf dem Weg
-> zum Bildschirm verloren geht: die präsentierten Frames waren schwarz, was in den
-> **Render-Targets** steht, hat niemand angesehen. Dafür ist der Frame-Dump wieder im
-> Auftrag, dichter und zusammen mit den Target-Dumps.
->
-> Die fps-Operation unten bleibt pausiert; die Prognose dazu steht in
-> [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
+> Auftrag: [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md). Die fps-Operation unten
+> bleibt pausiert, Prognose in [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
 
 ## Hier morgen weitermachen
 

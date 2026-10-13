@@ -133,6 +133,9 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
     const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)
                           : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped);
     const DWORD error = ok ? ERROR_SUCCESS : ::GetLastError();
+    // Every positioned read passes here, the guest's sceKernelPread and the AIO worker's alike
+    // (Aio.cpp calls this directly), so this is the one place that sees them all.
+    if (!write && ok) NoteFileRead_nid_no_patch(static_cast<std::int64_t>(done));
     if (!::SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
         throw std::runtime_error("NativePositioned: cannot restore the file offset");
     }
@@ -655,7 +658,6 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
     const auto result = NativePread(d, buf, nbytes, offset);
-    NoteFileRead_nid_no_patch(result);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
