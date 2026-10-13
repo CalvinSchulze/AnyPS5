@@ -20,6 +20,38 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
+## Dieser Branch sitzt jetzt auf aktuellem upstream
+
+> Am 14.10. neu aufgesetzt: Basis ist **upstream main vom 14.10.** mit voller Historie statt
+> des gesquashten 10.10.-Schnappschusses. Unsere Arbeit liegt als **vier Commits** darauf
+> (Dokumente, Carve-out, Instrumente, Regressionstest) — 22 Dateien, und künftige Importe
+> sind damit normale Merges. Der alte Stand bleibt als Branch `ghost-of-yotei-oct10-base`
+> erhalten, lokal und auf origin.
+>
+> **Warum der Umbau nötig war:** upstreams HLE-Module ließen sich nicht einzeln importieren —
+> `libkernel` braucht libc-Header, die der alte Baum nicht hatte, die Module sind gemeinsam
+> gewandert.
+>
+> **Was upstream mitbringt, und was davon unsere Menü-Spur trifft:**
+>
+> - **kqueue und kevent über die Event-Queue**, **File-Events**, `sceKernelGetEventError`,
+>   Equeue-Socket-Prüfung nach Mitgliedschaft — genau der Bereich, in dem drei Threads
+>   dauerhaft parken.
+> - **NP offline**: Auth-Lebenszyklus, Entitlement-Flags, Session-Signaling antwortet offline.
+> - `libSceSystemService`: LoadExec startet den Titel neu, No-Ops für ControllerSettings und
+>   ChallengeActivity, dazu **`ANYPS5_LANGUAGE`** als Schalter für die Konsolensprache.
+> - `libScePad` Winkelgeschwindigkeits-Deadband, `libSceAudioOut` EnableChat und
+>   Monitor-Infos.
+>
+> **Damit ist der erste Lauf auf diesem Stand ein Selbstzweck:** es ist gut möglich, dass das
+> Menü jetzt einfach kommt. Vorher muss der **ganze** PRX-Satz neu deployed werden, nicht
+> einzelne Module — der Baum ist vier Tage weitergewandert.
+>
+> **Eine Baustelle im Build:** das Vollbau-Ziel `relinker.rc` scheitert, weil `windres` die
+> Include-Pfade am **Leerzeichen** in „PS5 Emu" abschneidet. Einziger Fehler im ganzen Baum,
+> betrifft nur den Relinker (nicht die PRX-Module), und er kommt aus upstreams Build in
+> Verbindung mit unserem Pfad.
+
 ## Vorrang: der Titel hört nach dem Intro auf, überhaupt etwas zu verlangen
 
 > **Geschwindigkeit ist es nicht.** `APS5_TIME_SCALE=0.3` und `=0.15` verlangsamen die
