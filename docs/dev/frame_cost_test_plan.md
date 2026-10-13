@@ -1,5 +1,12 @@
 # Messplan: woraus der Frame wirklich besteht
 
+> **Gelaufen am 13.10., abgeschlossen.** Logs unter `_analytics/frame_cost_tests/`,
+> Ergebnisse im Hauptdokument. Kurz: Registerdruck und fehlende Optimierung sind
+> ausgeschlossen (kein Spilling, `SPIRV_OPT=full` bringt 1,4 %), Lauf 2 scheiterte am
+> Recompiler und ist als `APS5_SINGLE_LANE=<hex>` nachzuholen, und Lauf 5 hat die größte
+> Front freigelegt: **+48 % fps** ohne Write-back. Weiter in
+> [`storage_pingpong_test_plan.md`](storage_pingpong_test_plan.md).
+
 Auftrag für Messläufe, **nicht** für Code-Änderungen. Vorgeschichte und Zahlen in
 [`immediate_shader_boost.md`](immediate_shader_boost.md); der Carve-out ist gebaut,
 gemessen und bleibt an (16 MiB Default). Was hier geprüft wird, ist **nicht** mehr

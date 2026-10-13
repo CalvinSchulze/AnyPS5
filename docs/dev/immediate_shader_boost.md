@@ -44,33 +44,24 @@ von 66,8 auf **27,6 ms** pro Dispatch und die Szene von 6,4 auf **8,3 fps**, bei
 Kopien pro Present und ruhiger CPU-Seite — siehe
 [Carve-out](#der-carve-out-trägt-gemessen-24x-und-30--fps).
 
-**Hier weitermachen.** Vier Läufe sind durch (A/B/C/D, Logs in
-`_analytics/carve_out_tests/`), und sie haben die Front verschoben. Der nächste Messauftrag
-steht in [`frame_cost_test_plan.md`](frame_cost_test_plan.md):
+**Hier weitermachen.** Neun Läufe sind durch (A–D in `_analytics/carve_out_tests/`,
+1–5 in `_analytics/frame_cost_tests/`). Stand des Frames nach dem Carve-out: 100 ms, davon
+27,6 ms Flaschenhals, 19,8 ms zweiter Shader, 18,4 ms `draw`, 24 ms Storage-Image-Traffic.
 
-1. **Der Rest des Flaschenhalses ist der emittierte Code, nicht ein Speichermechanismus.**
-   27,6 ms mit vier Elementen device-lokal, 28,0 ms mit *allen* — PCIe ist zweifach
-   ausgeschlossen, und das Modul hat gar keine BDA-Schreibfunktion. ~89.000 Lane-Zyklen
-   pro Invocation reichen für 30.244 SPIR-V-Instruktionen aus. Erstes A/B:
-   `APS5_SINGLE_LANE=all`, das den Code halbiert — vorher wertlos, weil PCIe dominierte.
-   Siehe [zweite Kostenquelle](#zweite-kostenquelle-der-emittierte-code-selbst).
-2. **Der Frame besteht nicht aus einem Shader.** `draw` 18,4 ms und Storage-Image-Traffic
-   24 ms (721 MiB!) pro Present sind zusammen **42 % des Frames** und nie untersucht:
-   [Frame-Budget](#der-frame-besteht-nicht-aus-einem-shader).
-3. **`0x80003e8700`** liegt nicht an Buffern (Carve-out und `ALL_BUFFERS_WRITTEN` bewegen
-   ihn nicht). 16 Image-Fetches pro Invocation sind der Kandidat — aber device-lokal, nicht
-   PCIe: [zweiter Shader](#0x80003e8700-nicht-die-buffer-und-auch-nicht-pcie-bilder).
-4. Das **Fenster** ist eine Stellschraube: 4 MiB kostet 17 ms gegenüber 16 MiB, weil
-   Buffer 4 und 10 herausfallen. 16 MiB bleibt.
-
-**Zweite offene Front, jetzt zweifach bestätigt:** 27,6 ms pro Dispatch = 3,33 ms pro
-Mio. Invocations bleiben übrig, immer noch 50–250x über den billigen 4K-Pässen — und das
-in **zwei unabhängigen Läufen** (ganze Arena gespiegelt, und jetzt die vier Elemente
-device-lokal gestagt). Die Buffer liegen im Device-Speicher, PCIe ist als Erklärung dieses
-Restes damit raus. Hauptverdächtiger ist der **Lookup pro Zugriff** — eine nicht
-inlinebare Binärsuche über die Range-Tabelle, plus Device-Scope-Atomics pro Store;
-gelesen, nicht gemessen, mit Messplan unter
-[zweite Kostenquelle](#zweite-kostenquelle-verdacht-auf-den-lookup-pro-zugriff).
+1. **Größter Hebel: der Storage-Image-Pingpong.** `APS5_GPU_NO_WRITEBACK=1` bringt
+   **+48 % fps** (8,2 → 12,1) und drittelt dabei die Draws. Kein Fix, aber eine Obergrenze,
+   und sie ist riesig. Die Diagnose fehlt noch an *einer* Stelle: `APS5_CAPTURE_TRACE=1`
+   zeigt das Feld `cpuWrote` und entscheidet, ob der Treiber seine eigenen Write-backs für
+   Gast-Änderungen hält. Siehe [Pingpong](#die-größte-front-der-storage-image-pingpong).
+2. **Der Rest des Flaschenhalses ist ausgeführte Befehlsmenge**, nicht Speicher, nicht
+   Registerdruck (kein Spilling), nicht fehlende Optimierung (`SPIRV_OPT=full` bringt
+   1,4 %). Nächster Schritt ist klein: `APS5_SINGLE_LANE=800038be00` — die Adressform, weil
+   `=all` am Recompiler scheitert. Siehe
+   [Befehlsmenge](#zweite-kostenquelle-die-ausgeführte-befehlsmenge).
+3. **`0x80003e8700`** liegt nicht an Buffern. 16 Image-Fetches pro Invocation bei 46
+   Registern und 92 % Occupancy — Kandidat ist die Fetch-Arbeit selbst:
+   [zweiter Shader](#0x80003e8700-nicht-die-buffer-und-auch-nicht-pcie-bilder).
+4. Der **Carve-out** ist fertig und bleibt: 16 MiB gemessen, 4 MiB kostet 17 ms.
 
 **Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
 
@@ -493,76 +484,120 @@ dort wurden *alle* Ranges device-lokal gespiegelt, auch die, die kein Deskriptor
 und kein Bild sind. Zu prüfen mit einem Lauf, der die `[staging]`-Ranges dieses Shaders
 auflistet und mit seinen V#-Basen vergleicht.
 
-## Zweite Kostenquelle: der emittierte Code selbst
+## Zweite Kostenquelle: die ausgeführte Befehlsmenge
 
-**PCIe ist raus, zweifach.** `0x800038be00` kostet 27,6 ms, wenn seine vier großen
-Elemente device-lokal gestagt sind (Lauf B), und 28,0 ms, wenn **alle** seine Elemente
-device-lokal liegen (Lauf D, `ALL_BUFFERS_WRITTEN=1`). Gast-Speicherzugriff über PCIe
-erklärt diesen Rest nicht, und die vorher vermutete Schreibseite erklärt ihn auch nicht:
-das Modul definiert **keine** BDA-Schreibfunktion, also kein `note_bda_write`, also keine
-Device-Scope-Atomics pro Store. Der Verdacht aus dem Emitter trifft den *zweiten* Shader,
-nicht diesen.
+**PCIe ist raus, zweifach.** 27,6 ms mit vier Elementen device-lokal (Lauf B), 28,0 ms mit
+**allen** (Lauf D). Und die Schreibseite ist es nicht: das Modul definiert gar keine
+BDA-Schreibfunktion, also kein `note_bda_write`, keine Device-Scope-Atomics pro Store.
 
-**Was bleibt, ist das Zyklusbudget.** Grobrechnung über 84 SMs x 128 Lanes bei ~2,5 GHz:
+**Registerdruck ist es auch nicht** (`APS5_PIPELINE_STATS=1`):
 
-| Programm | ms | Invocations | Lane-Zyklen pro Invocation |
-|---|---|---|---|
-| `0x800038be00` | 27,6 | 8.294.400 | **~89.000** |
-| `0x80003e8700` | 19,8 | 2.073.600 | **~257.000** |
-| `0x80003f3600` (billig, gleiches Grid) | 0,55 | 8.294.400 | ~1.800 |
+| | Register | Binary Size | Stack | Shared |
+|---|---|---|---|---|
+| `0x800038be00` | 80 | **210.688 B** | **0** | 2560 B |
+| `0x80003e8700` | 46 | 74.240 B | 0 | 0 |
+| `0x80003f3600` (billig, gleiches Grid) | 71 | **28.672 B** | 0 | — |
 
-Das Modul des Flaschenhalses hat **30.244 SPIR-V-Instruktionen**. ~89.000 Lane-Zyklen pro
-Invocation heißt, dass die Invocation grob in der Größenordnung des *ganzen* Moduls
-Arbeit leistet — bei 85 SPIR-V-Words pro Guest-Instruktion, 34 % Masken-Ops und der
-1,90x-Verdopplung durch wave64-auf-32. Die Zahl ist eine Schätzung (volle Occupancy
-unterstellt, Stalls ignoriert), aber sie sagt: es braucht **keinen** weiteren
-Speichermechanismus, um 27,6 ms zu erklären. Der emittierte Code reicht dafür aus.
+`Stack Size = 0` heißt **kein Spilling**. Der Flaschenhals trägt aber **7,3x so viel
+Maschinencode** wie der gleich große, 50x billigere 4K-Pass.
 
-**Das widerspricht nicht dem früheren Ausschluss der Codegröße** — der verglich
-*Modulgrößen* zwischen Programmen (`0x8000269d00` hat 5,4x mehr Code und kostet 27x
-weniger). Modulgröße ist kein Maß für *ausgeführte* Instruktionen. Genau das fehlt und ist
-die nächste Messung:
+Zwei Dinge dabei genau nehmen: 80 Register sind **nicht** „hohe Occupancy" — bei 65.536
+Registern pro SM sind das 25 von 48 Warps, also **~52 %**, gegen ~92 % beim zweiten
+Shader. Es ist kein Katastrophenwert, aber die Hälfte. Und die gemeldete
+`Local Memory Size = 68719476736` ist genau 2^36 und damit ein Müllwert des Treibers, der
+nicht zitiert werden sollte.
 
-1. **Ausgeführte Instruktionen statt Modulgröße.** Trip-Counts der acht Schleifen des
-   Flaschenhalses (Hauptschleife `[9..29]`, 21 Blöcke, 164 Instruktionen) gegen die der
-   billigen Pässe. Ohne das ist jede Aussage über „zu viel Code" unbelegt.
-2. **Das erste echte Hebel-A/B:** `APS5_SINGLE_LANE=all` schaltet `laneCount` auf 1 und
-   halbiert den Code (131.449 → 69.258 Words). Das ist semantisch nur für
-   subgroup-unabhängige Programme korrekt, aber als *Messung* beantwortet es die Frage,
-   wie viel der 27,6 ms die Wave64-Emulation kostet. Vorher war der Lauf wertlos, weil
-   PCIe dominierte; jetzt nicht mehr.
-3. **Erst danach** der Lookup pro Zugriff (`get_bda_pointer`, nicht inlinebare Binärsuche
-   über die Range-Tabelle). Er bleibt ein Kandidat — 16 `read_bda_span`-Stellen und 8
-   `get_bda_pointer` im Modul —, aber die Speichertraffic läuft bei diesem Shader über das
-   Deskriptor-Array (714 `OpLoad`, 522 `OpAccessChain`), nicht über Zeiger.
+**Schlechte Optimierung ist es nicht** (`APS5_SPIRV_OPT=full`, volle SPIRV-Tools-Pipeline
+samt exhaustivem Inlining): 27,21 statt 27,59 ms, also **1,4 %**. Der zweite Shader 2,6 %.
+Da liegt nichts brach. (Der Lauf meldet `recompile 14,1 s` gegen 49,8 s der Basislinie —
+das ist niedriger *trotz* teurerer Optimierung, also war der Shader-Disk-Cache warm. Die
+Compile-Zeit von `=full` ist damit **nicht** gemessen, nur die Laufzeit.)
 
-## Der Frame besteht nicht aus einem Shader
+**Was bleibt: die Menge der ausgeführten Befehle.** 27,6 ms auf 8,29 Mio. Invocations sind
+~89.000 Befehls-Slots pro Invocation (84 SMs x 128 Lanes, 2,5 GHz, volle Auslastung
+unterstellt). Bei 210.688 Byte Maschinencode — grob 20.000 Instruktionen — heißt das, dass
+jede Invocation das Modul mehrfach durchläuft: **Trip-Counts**, multipliziert mit der
+Übersetzungsexpansion (85 SPIR-V-Words pro Guest-Instruktion, 34 % Masken-Ops, 1,90x
+wave64-auf-32).
 
-Das 71-%-Bild vom 12.10. war eine Artefakt der Zählung: es verglich nur die
-*Programm*-Zeiten untereinander. Die `by class`-Zeile derselben Läufe zeigt den ganzen
-Frame. Lauf B, 8.340 ms Ranges auf 83 Presents = **100 ms pro Frame**:
+**Nächste Messung, und sie ist klein:** `APS5_SINGLE_LANE` nimmt eine **Programmadresse**,
+nicht nur `all`. Der `=all`-Lauf ist an fremden Shadern gescheitert (siehe unten), aber
+`APS5_SINGLE_LANE=800038be00` trifft nur den Flaschenhals und beantwortet, was die
+Wave64-Emulation von den 27,6 ms kostet.
 
-| Posten | pro Present | Anteil | Bytes pro Present |
-|---|---|---|---|
-| `0x800038be00` | 27,6 ms | 28 % | — |
-| `0x80003e8700` | 19,8 ms | 20 % | — |
-| `draw` | **18,4 ms** | 18 % | — |
-| `storage-writeback` | **13,9 ms** | 14 % | **375 MiB** |
-| `storage-upload` | **10,1 ms** | 10 % | **347 MiB** |
-| zehn weitere Programme | 6,7 ms | 7 % | — |
-| Staging (in + out) | 2,3 ms | 2 % | 88 MiB |
-| `fill`, `fill-clear`, `dcc-*`, `present-blit` | 1,2 ms | 1 % | 310 MiB |
+**Noch nicht gemessen, aber weiter Kandidat:** der Lookup pro Zugriff
+(`get_bda_pointer`, nicht inlinebare Binärsuche). Keiner der fünf Läufe hat ihn berührt —
+dass der Flaschenhals in Lauf 5 unverändert bleibt, zeigt nur, dass seine Kosten vom
+Storage-Pfad unabhängig sind, nichts über den Lookup. Und seine Speichertraffic läuft
+über das Deskriptor-Array (714 `OpLoad`, 522 `OpAccessChain`), nicht über Zeiger.
 
-**721 MiB pro Present** wandern durch `storage-upload` und `storage-writeback`, 31 bzw.
-43 Mal pro Present, für zusammen **24 ms = ein Viertel des Frames**. Das ist so groß wie
-der Flaschenhals, den wir den ganzen Tag jagen, und bisher völlig unangetastet. Es ist
-dieselbe Mechanik, die CPU-seitig als `B images` 581 s kostet.
+### Nebenbefund: `APS5_SINGLE_LANE=all` bricht den Recompiler
 
-Dazu 18,4 ms `draw` pro Present — auch das nie untersucht.
+Der Lauf erreicht die Render-Schleife nicht (0 Presents). Drei Fehler beim Vorbereiten
+früher Shader:
 
-**Reihenfolge der Fronten** ist damit neu zu bewerten: der Rest des Flaschenhalses
-(27,6 ms) ist der größte Einzelposten, aber Storage-Image-Traffic plus Draws sind
-zusammen 42 ms und damit die größere Hälfte des Frames.
+```
+0x80001f1100: GetImageResource dword 0 is not a valid runtime value
+0x8000139c00: GetImageResource dword 0 is not a valid runtime value
+0x80000bb700: value IR instruction definition does not dominate its use
+```
+
+Der dritte ist eine gebrochene SSA-Invariante, also ein echter Defekt auf dem
+`laneCount=1`-Pfad — notierenswert, aber kein Blocker: die Adressform des Schalters
+umgeht ihn.
+
+## Die größte Front: der Storage-Image-Pingpong
+
+`APS5_GPU_NO_WRITEBACK=1` hält GPU-Ergebnisse aus dem Gastspeicher heraus. Als reine
+Obergrenze gemessen, und sie ist groß:
+
+| | Lauf 1 (Referenz) | Lauf 5 (`GPU_NO_WRITEBACK`) |
+|---|---|---|
+| Presents / 10 s | 82 (~8,2 fps) | **121 (~12,1 fps)**, +48 % |
+| GPU busy | 104,3 ms | **77,3 ms** |
+| `draw` pro Present | 18,97 ms | **7,25 ms** |
+| `storage-upload` | 10,31 ms (349 MiB) | **5,89 ms** (216 MiB) |
+| `storage-writeback` | 14,68 ms (375 MiB) | **8,15 ms** (210 MiB) |
+| `0x800038be00` | 27,55 ms | 26,73 ms |
+
+Der Write-back kostet also nicht nur sich selbst: er halbiert auch die **Uploads** und
+drittelt die **Draws**. Zusammen ~27 ms pro Frame. Die beiden heißen Dispatches rühren
+sich nicht — die Fronten sind unabhängig.
+
+**Was der Trace sagt — und was nicht.** `APS5_TRACE_UPLOAD=1` liefert 6.505 Upload-Gründe:
+84 % „guest memory changed", 16 % „DCC keys changed", bei den häufigsten Auflösungen
+3840x2160 (36,7 %) und den häufigsten Adressen `0x5000860000+0x1fe0000` (491x, ein ~32-MiB-
+4K-Target). Es sind also **wenige große Rendertargets**, die Frame für Frame neu
+hochgeladen werden, nicht viele kleine Texturen.
+
+**Aber „guest memory changed" ist keine Diagnose.** Der Trace druckt diesen String
+schlicht im else-Zweig (`Texture.cpp:1467`):
+
+```cpp
+keys != uploadedKeys ? "DCC keys changed" : "guest memory changed"
+```
+
+Die eigentliche Entscheidung fällt oberhalb davon im Pro-Layer-Vergleich, und im
+dominierenden Fall steht `dirty 0` — die Images sind also **nicht** als schmutzig
+markiert. Was sie als geändert einstuft, ist damit offen.
+
+**Die Hypothese, die Lauf 5 stützt:** der Write-back schreibt die GPU-Ergebnisse in den
+Gastspeicher, die Write-Watch sieht die Blöcke als geschrieben, und der nächste Refresh
+hält genau diese Bytes für eine Gast-Änderung und lädt sie zurück. Ein Pingpong, in dem
+der Treiber seine eigenen Schreibzugriffe nicht von denen des Spiels unterscheidet. Dass
+Lauf 5 die Uploads **mit** halbiert, obwohl der Schalter nur den Write-back abschaltet,
+passt genau dazu.
+
+**Die Gegenprobe ist klein:** `APS5_CAPTURE_TRACE=1` schaltet die Zeile
+`refresh image=... dirty=.. keysChanged=.. cpuWrote=..` frei (`Texture.cpp:1460`). Das
+Feld `cpuWrote` sagt direkt, ob ein CPU-Schreibzugriff die Ursache ist — und für die
+4K-Target-Adressen entscheidet es die Hypothese. Erst danach lohnt es, am Pfad zu bauen;
+die Maschinerie dafür (`Recorder::NoteWrittenBack`, `GuestMemory::StoredOver`,
+`stampedBlocks`) ist vorhanden. Auftrag:
+[`storage_pingpong_test_plan.md`](storage_pingpong_test_plan.md).
+
+**Kein Fix:** `APS5_GPU_NO_WRITEBACK=1` bricht die Korrektheit per Definition. Die 12,1 fps
+sind eine Obergrenze, keine Zielmarke.
 
 ## Upstream-Abgleich (Stand 13.10.)
 
