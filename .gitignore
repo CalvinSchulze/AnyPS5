@@ -109,3 +109,8 @@ cookies.txt
 
 .env
 .env.local
+
+# Analyse-Rohdaten und Shader-Dumps dieser Operation (siehe docs/dev/immediate_shader_boost.md)
+_analytics/
+shader_*.req
+shader_cache/
