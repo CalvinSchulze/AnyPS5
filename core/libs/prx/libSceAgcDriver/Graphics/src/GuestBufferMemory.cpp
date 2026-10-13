@@ -2974,6 +2974,14 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     };
     const auto* own = candidate(regions);
     const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
+    // A region carved out of a base region (addDescriptorRegion) can begin above the base region
+    // and end at or below the address, which the base region still holds: the elements of a
+    // dispatch sit back to back, so a carve-out ending exactly where the next element begins would
+    // otherwise be handed out as that element's owner and fail the caller's end check. One that
+    // contains the address therefore wins over one that merely begins below it; where both contain
+    // it (a carve-out inside its base region) the greater begin wins, as before.
+    const auto holds = [address](const Region* region) { return region != nullptr && address < region->end; };
+    if (holds(own) != holds(shared)) return holds(own) ? own : shared;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;
     return own;
 }
@@ -2997,13 +3005,22 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
     const Region* inside = nullptr;
+    bool carvedOut = false;
     switch (baseOverlap(begin, end, &inside)) {
         case BaseOverlap::Inside:
             if (!servesView(*inside, begin)) {
                 dissolveSpace(false);
                 break;
             }
-            return;
+            // The base region serves the range, and for the registered arena of an address-based
+            // build that means a host import read in place: every access of every invocation goes
+            // over PCIe. A swept written element is carved out of the base region instead, so
+            // stagingEligible can give it a device-local shadow; AddressRanges subtracts the span
+            // from the base ranges so the published table stays disjoint. Everything else is
+            // served by the base region as before.
+            if (!carveOutEligible(begin, end, swept)) return;
+            carvedOut = true;
+            break;
         case BaseOverlap::Partial:
             if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
                 readsOverBase.emplace_back(begin, end);
@@ -3020,6 +3037,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     Region region{begin, end, true, {}, nullptr};
     region.atomic = atomic;
     region.swept = swept;
+    region.carvedOut = carvedOut;
     region.lastView = begin;
     auto committed = GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin));
     if (!committed.whole) {
@@ -3229,6 +3247,13 @@ VkBufferUsageFlags gpuCopyUsage(bool addressable) {
 // frames, would only gain the two copies), APS5_ATOMIC_STAGE_MAX_KIB (1024) the atomic one.
 constexpr std::uint64_t SweptShadowMax = std::uint64_t{16} << 20u;
 
+// APS5_NO_ADDRESSABLE_STAGING=1 keeps address-based builds reading their swept elements in place
+// as before, which is the A/B of the carve-out below.
+bool carveOutsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_ADDRESSABLE_STAGING") != nullptr;
+    return !disabled;
+}
+
 bool writtenShadowEnabled() {
     static const bool disabled = std::getenv("APS5_NO_WRITTEN_SHADOW") != nullptr;
     return !disabled;
@@ -3365,11 +3390,20 @@ bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) 
 }
 
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
-    if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
+    // An address-based build reads its ranges through pointers, so only a region carved out of a
+    // base region takes a shadow: AddressRanges publishes that region's own device address and
+    // leaves the carved span out of the base range (see addDescriptorRegion).
+    if (!stagingAllowed || (addressable && !region.carvedOut) || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
+}
+
+bool GuestBufferMemory::carveOutEligible(std::uint64_t begin, std::uint64_t end, bool swept) const {
+    if (!swept || !carveOutsEnabled() || !stagingAllowed || !gpuCopiesEnabled() || !writtenShadowEnabled()) return false;
+    const auto bytes = end - begin;
+    return bytes >= writtenShadowMin() && bytes <= std::max(writtenShadowMax(), SweptShadowMax);
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
@@ -3417,6 +3451,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             if (region.end > previous.end) previous.direct = nullptr;
             previous.atomic = previous.atomic || region.atomic;
             previous.swept = previous.swept || region.swept;
+            previous.carvedOut = previous.carvedOut || region.carvedOut;
             previous.sparseHeap = previous.sparseHeap || region.sparseHeap;
             // A range starting before the mirror (only possible after the swap) keeps its prefix; the
             // earlier merged region ends at or before it, so the merged list stays sorted.
@@ -4088,7 +4123,43 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> combined;
         combined.reserve(result.size() + space->ranges.size());
-        std::merge(space->ranges.begin(), space->ranges.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        // The spans carved out of the base regions (addDescriptorRegion): the regions above publish
+        // them with their own device address, so the base ranges must not cover them too. The
+        // emitted lookup binary-searches the table for the one range holding every byte of an
+        // access, which needs the entries ascending and disjoint; two entries over the same guest
+        // byte would make the search pick by position, not by intent.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> carved;
+        for (const auto& region : regions) {
+            if (!region.carvedOut) continue;
+            if (!carved.empty() && region.begin <= carved.back().second) carved.back().second = std::max(carved.back().second, region.end);
+            else carved.emplace_back(region.begin, region.end);
+        }
+        std::vector<ShaderRecompiler::BdaAbi::Range> base;
+        if (carved.empty()) {
+            base.assign(space->ranges.begin(), space->ranges.end());
+        } else {
+            base.reserve(space->ranges.size() + carved.size() * 2u);
+            std::size_t first = 0;
+            for (const auto& range : space->ranges) {
+                while (first < carved.size() && carved[first].second <= range.begin) ++first;
+                auto cursor = range.begin;
+                const auto keep = [&](std::uint64_t stop) {
+                    if (cursor >= stop) return;
+                    auto part = range;
+                    part.begin = cursor;
+                    part.end = stop;
+                    part.deviceAddress += cursor - range.begin;
+                    base.push_back(part);
+                    cursor = stop;
+                };
+                for (auto index = first; index < carved.size() && carved[index].first < range.end; ++index) {
+                    keep(std::min(range.end, carved[index].first));
+                    cursor = std::max(cursor, std::min(range.end, carved[index].second));
+                }
+                keep(range.end);
+            }
+        }
+        std::merge(base.begin(), base.end(), result.begin(), result.end(), std::back_inserter(combined), [](const auto& left, const auto& right) { return left.begin < right.begin; });
         result = std::move(combined);
     }
     if (writes.empty()) return result;
