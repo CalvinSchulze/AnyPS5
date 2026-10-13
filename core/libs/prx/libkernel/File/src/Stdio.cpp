@@ -223,6 +223,9 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
     const BOOL ok = write ? ::WriteFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped)
                           : ::ReadFile(handle, buf, static_cast<DWORD>(nbytes), &done, &overlapped);
     const DWORD error = ok ? ERROR_SUCCESS : ::GetLastError();
+    // Every positioned read passes here, the guest's sceKernelPread and the AIO worker's alike
+    // (Aio.cpp calls this directly), so this is the one place that sees them all.
+    if (!write && ok) NoteFileRead_nid_no_patch(static_cast<std::int64_t>(done));
     if (!::SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) {
         throw std::runtime_error("NativePositioned: cannot restore the file offset");
     }

@@ -1711,6 +1711,23 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+// Debug aid: APS5_TRACE_ALIAS=1 names, once per surface and reason, why the flush stores an
+// alias's pending units instead of borrowing them on the device (borrowUnits). That store is what
+// makes this image re-upload (uploadReason "flushed"), and it is the 24 ms per present of the
+// image round trip. Six reasons can refuse the alias; the first five are states that could be
+// arranged, the sixth is a genuine ambiguity.
+void TraceAliasRefusal(std::uint64_t address, const char* why) {
+    static const bool trace = std::getenv("APS5_TRACE_ALIAS") != nullptr;
+    if (!trace) return;
+    static std::mutex mutex;
+    static std::vector<std::pair<std::uint64_t, std::string>> seen;
+    std::lock_guard lock(mutex);
+    const std::pair<std::uint64_t, std::string> key{address, why};
+    if (std::find(seen.begin(), seen.end(), key) != seen.end()) return;
+    seen.push_back(key);
+    std::fprintf(stderr, "[alias] 0x%llx: %s\n", static_cast<unsigned long long>(address), why);
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1739,16 +1756,24 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    if (alias == nullptr) TraceAliasRefusal(descriptor.baseAddress, "no pending alias over this memory");
+    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) {
+        TraceAliasRefusal(descriptor.baseAddress, "keys not uncompressed, or no host import");
+        alias = nullptr;
+    }
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) {
+            TraceAliasRefusal(descriptor.baseAddress, "ChangedBlocks reports untracked");
+            alias = nullptr;
+        }
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
-                alias = nullptr;
-                break;
-            }
+            if (alias->layerGeneration[unit] == 0) TraceAliasRefusal(descriptor.baseAddress, "a pending unit of the alias has no generation");
+            else if (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit]) TraceAliasRefusal(descriptor.baseAddress, "a unit is pending in both images");
+            else continue;
+            alias = nullptr;
+            break;
         }
     }
     // No publish: the upload below reads the stored units from the unit shadow itself.
