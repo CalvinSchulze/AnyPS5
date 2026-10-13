@@ -16,6 +16,36 @@ Konkret heißt das:
 - Wenn ein Lauf nicht durchführbar ist oder ein Schalter fehlt: sagen, nicht ersetzen.
 - Ein Satz „fertig, hier sind die Zahlen" am Ende reicht. **Kein Fazit-Abschnitt.**
 
+## Bauen und Deployen: ja, nötig
+
+Dieser Auftrag braucht einen **neuen Build**, weil der Schalter aus Lauf 1 neu ist.
+
+**Was zu bauen ist:** `libc.prx` — der Dump sitzt in
+`core/libs/prx/libc/src/specifics/windows/CrashReport.cpp`.
+
+```
+ninja core/libs/libs/libc.prx
+```
+
+Mit dem Toolchain-`bin` dieses Rechners im `PATH` (Ninja und g++ liegen im Scratchpad einer
+früheren Sitzung, `cmake` ist **nicht** im `PATH`):
+
+```
+C:\Users\CptWhuti\AppData\Local\Temp\claude\I--Emulation-PS5-Emu-Software-AnyPS5\685ea80c-0bfb-4ab4-b237-3f3880416715\scratchpad\mingw64\bin
+```
+
+Ergebnis liegt als `build/core/libs/libs/libc.prx` (NID-gepatcht) und
+`build/core/libs/libs/unpatched/libc.prx`.
+
+**Deployen:** so, wie dieser Rechner den Titel mit unseren PRX-Modulen versorgt — diesen
+Schritt bitte **im Bericht benennen**, damit er nachvollziehbar bleibt.
+
+**Und dann prüfen, dass es greift.** Ohne diese Kontrolle ist der Lauf wertlos, weil ein
+alter Binary stillschweigend dieselben Logzeilen liefert wie vorher:
+
+> Im Log muss mindestens **eine** `[guestdump]`-Zeile stehen. Fehlt sie, hat Build oder
+> Deploy nicht gegriffen — **abbrechen und melden**, nicht weiterlaufen lassen.
+
 ## Stand, soweit gemessen
 
 Aus den Läufen in `_analytics/menu_blocker/`:
