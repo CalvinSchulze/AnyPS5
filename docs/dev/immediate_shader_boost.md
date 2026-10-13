@@ -47,10 +47,12 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 > Menü jetzt einfach kommt. Vorher muss der **ganze** PRX-Satz neu deployed werden, nicht
 > einzelne Module — der Baum ist vier Tage weitergewandert.
 >
-> **Eine Baustelle im Build:** das Vollbau-Ziel `relinker.rc` scheitert, weil `windres` die
-> Include-Pfade am **Leerzeichen** in „PS5 Emu" abschneidet. Einziger Fehler im ganzen Baum,
-> betrifft nur den Relinker (nicht die PRX-Module), und er kommt aus upstreams Build in
-> Verbindung mit unserem Pfad.
+> **Der Build ist vollständig grün.** Das einzige gescheiterte Ziel war `relinker.rc`:
+> `windres` gibt die Include-Pfade unquotiert an den Präprozessor weiter, und der zerbricht
+> am **Leerzeichen** in „PS5 Emu". Die Ressource bindet nur `<winuser.h>` ein und braucht
+> keinen einzigen Projekt-Include, also halten die `target_include_directories` sie jetzt
+> über `$<COMPILE_LANGUAGE:CXX>` von der RC-Übersetzung fern. Manifest ist nachweislich
+> eingebettet (`.rsrc`-Sektion vorhanden), Vollbau **0 Fehler**.
 
 ## Vorrang: der Titel hört nach dem Intro auf, überhaupt etwas zu verlangen
 
