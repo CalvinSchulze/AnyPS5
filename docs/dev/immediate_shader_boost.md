@@ -44,17 +44,23 @@ von 66,8 auf **27,6 ms** pro Dispatch und die Szene von 6,4 auf **8,3 fps**, bei
 Kopien pro Present und ruhiger CPU-Seite — siehe
 [Carve-out](#der-carve-out-trägt-gemessen-24x-und-30--fps).
 
-**Drei Dinge als nächstes, in dieser Reihenfolge:**
+**Hier weitermachen.** Vier Läufe sind durch (A/B/C/D, Logs in
+`_analytics/carve_out_tests/`), und sie haben die Front verschoben:
 
-1. **Lauf C nachholen.** Er brach bei `SWEPT_SHADOW_MAX_KIB=4096` ab und hat damit einen
-   latenten Fehler in `owner()` gefunden, der jetzt behoben ist. Das kleinere Fenster ist
-   **nicht** das Problem gewesen, siehe [Lauf C](#lauf-c-hat-einen-latenten-fehler-gefunden-nicht-eine-fenstergrenze).
-2. **`0x80003e8700`** (20 % GPU-Last) rührt sich unter dem Carve-out nicht, fällt unter
-   `NO_HOST_IMPORT` aber um 6,4x. Zwei Kandidaten, einer davon ein **Read-only-Carve-out**,
-   der billiger wäre als der geschriebene Fall:
-   [offene Front](#offen-0x80003e8700-rührt-sich-nicht).
-3. **Die zweite Kostenquelle** ist jetzt sauber eingekreist: 27,6 ms *mit* device-lokalen
-   Puffern sind nachweislich kein PCIe mehr.
+1. **Der Rest des Flaschenhalses ist der emittierte Code, nicht ein Speichermechanismus.**
+   27,6 ms mit vier Elementen device-lokal, 28,0 ms mit *allen* — PCIe ist zweifach
+   ausgeschlossen, und das Modul hat gar keine BDA-Schreibfunktion. ~89.000 Lane-Zyklen
+   pro Invocation reichen für 30.244 SPIR-V-Instruktionen aus. Erstes A/B:
+   `APS5_SINGLE_LANE=all`, das den Code halbiert — vorher wertlos, weil PCIe dominierte.
+   Siehe [zweite Kostenquelle](#zweite-kostenquelle-der-emittierte-code-selbst).
+2. **Der Frame besteht nicht aus einem Shader.** `draw` 18,4 ms und Storage-Image-Traffic
+   24 ms (721 MiB!) pro Present sind zusammen **42 % des Frames** und nie untersucht:
+   [Frame-Budget](#der-frame-besteht-nicht-aus-einem-shader).
+3. **`0x80003e8700`** liegt nicht an Buffern (Carve-out und `ALL_BUFFERS_WRITTEN` bewegen
+   ihn nicht). 16 Image-Fetches pro Invocation sind der Kandidat — aber device-lokal, nicht
+   PCIe: [zweiter Shader](#0x80003e8700-nicht-die-buffer-und-auch-nicht-pcie-bilder).
+4. Das **Fenster** ist eine Stellschraube: 4 MiB kostet 17 ms gegenüber 16 MiB, weil
+   Buffer 4 und 10 herausfallen. 16 MiB bleibt.
 
 **Zweite offene Front, jetzt zweifach bestätigt:** 27,6 ms pro Dispatch = 3,33 ms pro
 Mio. Invocations bleiben übrig, immer noch 50–250x über den billigen 4K-Pässen — und das
@@ -70,7 +76,7 @@ gelesen, nicht gemessen, mit Messplan unter
 | Hypothese | Womit widerlegt |
 |---|---|
 | Auflösung / 4K-Grid | Drei Programme mit denselben 8.294.400 Invocations kosten 0,013–0,067 ms/Mio. |
-| SPIR-V-Codegröße (102x Expansion) | `0x8000269d00` hat 5,4x mehr Code und kostet 27x weniger |
+| SPIR-V-**Modulgröße** als Prädiktor | `0x8000269d00` hat 5,4x mehr Code und kostet 27x weniger. **Achtung:** das schließt nur die Modulgröße aus, nicht die *ausgeführten* Instruktionen — die sind ungemessen und jetzt Hauptverdächtiger |
 | Schleifen / Trip-Counts | `0x80003e8700` ist schleifenfrei und pro Invocation teurer |
 | Wave64 auf Subgroup-32 | Alle zwölf Programme sind wave64, auch die billigen; Codeeffekt nur 1,90x |
 | Speicherbandbreite | ~34 MB pro Dispatch in 66 ms = ~0,5 GB/s von ~960 GB/s |
@@ -409,16 +415,21 @@ prüft das jetzt), und die Sweep-Erkennung trägt die Thread-Zahl von `Dispatch.
 
 **Messung** (A/B aus einem Binary, Logs unter `_analytics/carve_out_tests/`):
 
-| | A: `NO_ADDRESSABLE_STAGING=1` | B: Carve-out |
-|---|---|---|
-| `0x800038be00` pro Dispatch | 66,8 ms | **27,6 ms** (2,42x) |
-| `0x80003e8700` pro Dispatch | 19,9 ms | 19,8 ms (unverändert) |
-| Presents / 10 s | 64 (~6,4 fps) | **83 (~8,3 fps)**, +30 % |
-| GPU busy / idle gaps | 140,2 / 17,1 ms | 102,7 / 17,3 ms |
-| gestagte Regionen | 192 (nur ≤ 640 KiB) | 1.743, inkl. 16,2 / 8,0 / 2x 4,1 MB |
-| Staging-Kopien pro Present | ~0,09 ms | **~2,34 ms** (1,20 in + 1,14 out) |
-| `mirror prepare` pro Build | 0 us | **0 us** |
-| `[bda-table]` hits / misses | 631 / 189 | 664 / 415 |
+| | A: kein Staging | B: 16 MiB | C: 4 MiB | D: `ALL_BUFFERS_WRITTEN` |
+|---|---|---|---|---|
+| `0x800038be00` pro Dispatch | 66,8 ms | **27,6 ms** (2,42x) | 44,4 ms | 28,0 ms |
+| `0x80003e8700` pro Dispatch | 19,9 ms | 19,8 ms | 18,4 ms | 19,1 ms |
+| Presents / 10 s | 64 (~6,4 fps) | **83 (~8,3 fps)** | 72 (~7,2 fps) | — |
+| GPU busy / idle gaps | 140,2 / 17,1 ms | 102,7 / 17,3 ms | 116,2 / 23,1 ms | — |
+| gestagte Regionen | 192 (nur ≤ 640 KiB) | 1.743 (16,2 / 8,0 / 2x 4,1 MB) | 1.368 (ohne 16,2 / 8,0) | alle |
+| Staging-Kopien pro Present | ~0,09 ms | **~2,34 ms** | ~1,25 ms | — |
+| `mirror prepare` pro Build | 0 us | **0 us** | 0 us | 0 us |
+| `[bda-table]` hits / misses | 631 / 189 | 664 / 415 | 575 / 360 | — |
+
+**Das Fenster ist die Stellschraube, nicht ein Fehler.** Bei 4 MiB fallen Buffer 4
+(16,2 MB) und Buffer 10 (8,0 MB) heraus und laufen wieder über PCIe: 44,4 statt 27,6 ms,
+7,2 statt 8,3 fps. Die beiden tragen also allein ~17 ms. 16 MiB deckt sie, und die
+Kopierkosten steigen dafür nur von 1,25 auf 2,34 ms pro Present.
 
 Der Flaschenhals landet damit **genau auf dem Niveau des `NO_HOST_IMPORT`-Laufs** (27,6 ms)
 — aber ohne dessen Preis: 2,34 ms Kopien pro Present statt 44 ms Mirror-Vorbereitung pro
@@ -451,60 +462,106 @@ bisher das größere `begin`. Das betrifft auch die vier Write-Back-Pfade, die �
 `owner(begin)` gehen. Regressionstest in `tests/BdaResources.cpp`: ein gefegtes Element,
 ein nicht gefegtes direkt dahinter, und die Prüfung, dass die Tabelle disjunkt bleibt.
 
-Lauf C ist damit **nachzuholen** — mit dem Fix sollte das kleinere Fenster nur weniger
-Ranges stagen, nicht abbrechen.
+**Nachgeholt:** mit dem Fix läuft Lauf C sauber durch und beantwortet die Fensterfrage
+(44,4 ms bei 4 MiB gegen 27,6 bei 16 MiB). Der Abbruch war der Fehler, nicht die Grenze.
 
-### Offen: `0x80003e8700` rührt sich nicht
+### `0x80003e8700`: nicht die Buffer, und auch nicht PCIe-Bilder
 
-Der zweite Shader (20 % GPU-Last) fällt unter `NO_HOST_IMPORT` um **6,4x** auf 3,0 ms,
-unter dem Carve-out aber **gar nicht** (19,9 → 19,8 ms). Seine Kosten sind also ebenfalls
-PCIe-In-place-Zugriff, aber keines seiner drei Elemente wird gecarvt. Zwei Kandidaten,
-beide in einem Lauf zu trennen:
+Der zweite Shader (20 % GPU-Last) fällt unter `NO_HOST_IMPORT` um 6,4x auf 3,0 ms, rührt
+sich unter dem Carve-out aber nicht (19,9 → 19,8 ms), und auch `ALL_BUFFERS_WRITTEN=1`
+bewegt ihn nicht (19,1 ms). Seine Buffer-Elemente sind also nicht die Kosten.
 
-1. **Seine Elemente werden nicht geschrieben.** Das Written-Shadow-Staging verlangt
-   `WritesOverlap`, ein nur *gelesenes* Element in einem Host-Import kann es nicht
-   erreichen — obwohl es pro Zugriff genauso über PCIe geht. Gegenprobe:
-   `APS5_ALL_BUFFERS_WRITTEN=1`. Fällt der Shader damit, ist es das, und die Richtung ist
-   ein **Read-only-Carve-out**: nur Copy-in, kein Copy-back, also billiger als der
-   geschriebene Fall.
-2. **Die Sweep-Schwelle greift nicht.** 2.073.600 Threads bei `8x8x1`; wenn Stride x
-   Threads weniger als die Hälfte des Elements deckt, ist es nicht gefegt. Sichtbar im
-   `[staging]`-Trace: fehlen seine Ranges dort ganz, ist Kandidat 1 dran; erscheinen sie
-   nicht, obwohl sie geschrieben werden, Kandidat 2.
+Aus dem Dump (`agc_shader_replay --spv`, dann Opcode-Zählung) kommt der Unterschied:
 
-## Zweite Kostenquelle: Verdacht auf den Lookup pro Zugriff
+| | `0x800038be00` | `0x80003e8700` |
+|---|---|---|
+| `OpImageFetch` | **2** | **16** |
+| `OpLoad` / `OpAccessChain` | 714 / 522 | 288 / 263 |
+| `OpConvertUToPtr` | 16 | 20 |
+| BDA-Schreibfunktionen im Modul | **keine** | `get_bda_write_pointer`, `note_bda_write`, `write_bda_bytes`, `get_bda_atomic_pointer` |
 
-Jetzt die Hauptfront. Dass der Rest **nicht** PCIe ist, steht nach dem Carve-out fest:
-derselbe Shader kostet 27,6 ms, obwohl seine vier großen Elemente device-lokal liegen.
-Der Verdacht ist aus dem Emitter gelesen, nicht gemessen, passt aber zu allem, was die
-Tabelle oben zeigt. Jeder BDA-Zugriff ruft `get_bda_pointer` (`SpirvBdaLookup.cpp:21`), und diese
-Funktion ist
+**16 Image-Fetches pro Invocation** bei 2,07 Mio. Invocations sind ~33 Mio. Fetches — das
+ist der Kandidat. **Aber nicht als PCIe-Zugriff:** Storage-Images werden in device-lokale
+`VkImage`s hochgeladen, und das Log zeigt genau das, 347 MiB pro Present in der Klasse
+`storage-upload`. Ein Fetch trifft Device-Speicher. Die 19,8 ms sind damit entweder die
+Fetch-Arbeit selbst (Tiling, Formatumrechnung, emulierte Filterung) oder die BDA-Schreibseite,
+die nur dieser Shader hat.
 
-- mit `FunctionControlDontInlineMask` deklariert — der Treiber kann sie nicht inlinen,
-  nicht hoisten, nicht über Zugriffe hinweg zusammenfassen,
-- eine **Binärsuche über die publizierte Range-Tabelle** mit `low`/`high` in
-  `StorageClassFunction`-Variablen, pro Iteration ein `OpLoad` aus dem Pagetable-Puffer
-  (bei 856 Ranges ~10 Iterationen),
-- gefolgt von ~10 Validierungszweigen (Version, Entry-Size, Permissions, Overflow).
+**Warum er unter `NO_HOST_IMPORT` trotzdem fiel**, ist damit offen und die nächste Frage:
+dort wurden *alle* Ranges device-lokal gespiegelt, auch die, die kein Deskriptor-Element
+und kein Bild sind. Zu prüfen mit einem Lauf, der die `[staging]`-Ranges dieses Shaders
+auflistet und mit seinen V#-Basen vergleicht.
 
-Und jeder BDA-**Store** ruft zusätzlich `note_bda_write` (`:118`): eine Hash-Probe-Schleife
-über den Fault-Buffer mit `OpAtomicLoad` und `OpAtomicCompareExchange` auf
-**Device-Scope**, pro Store.
+## Zweite Kostenquelle: der emittierte Code selbst
 
-Das erklärt genau das, was kein statisches Attribut erklärt hat: Kosten skalieren mit der
-Zahl der **Zugriffe pro Invocation**, nicht mit Buffer-Zahl, Codegröße oder BDA-Präsenz
-allein. 8,29 Mio. Invocations mal mehrere Zugriffe mal (Binärsuche + Atomics) ist
-Overhead pro Zugriff — und das passt zu den gemessenen ~0,5 GB/s effektiver Bandbreite.
+**PCIe ist raus, zweifach.** `0x800038be00` kostet 27,6 ms, wenn seine vier großen
+Elemente device-lokal gestagt sind (Lauf B), und 28,0 ms, wenn **alle** seine Elemente
+device-lokal liegen (Lauf D, `ALL_BUFFERS_WRITTEN=1`). Gast-Speicherzugriff über PCIe
+erklärt diesen Rest nicht, und die vorher vermutete Schreibseite erklärt ihn auch nicht:
+das Modul definiert **keine** BDA-Schreibfunktion, also kein `note_bda_write`, also keine
+Device-Scope-Atomics pro Store. Der Verdacht aus dem Emitter trifft den *zweiten* Shader,
+nicht diesen.
 
-Upstream rührt diesen Lookup **nicht** an (nachgesehen: nur `f1b2e605e`, `803a13127`,
-`e7b4c0554`, `73e0890c2`, `c0348a02b`, alle Korrektheit, `note_bda_write` wird dabei sogar
-teurer). Das Feld ist also unbesetzt.
+**Was bleibt, ist das Zyklusbudget.** Grobrechnung über 84 SMs x 128 Lanes bei ~2,5 GHz:
 
-**Messplan, bevor etwas gebaut wird:** Zahl der BDA-Zugriffe pro Invocation aus dem
-SPIR-V zählen (`OpFunctionCall` auf `get_bda_pointer` / `get_bda_write_pointer` im
-Entry-Code, gewichtet mit den Schleifen-Trip-Counts) und gegen `ms/Mio. Inv` der elf
-Programme auftragen. Wenn das der Prädiktor ist, den die statischen Attribute nicht
-hergaben, ist die Richtung belegt, bevor eine Zeile Emitter angefasst wird.
+| Programm | ms | Invocations | Lane-Zyklen pro Invocation |
+|---|---|---|---|
+| `0x800038be00` | 27,6 | 8.294.400 | **~89.000** |
+| `0x80003e8700` | 19,8 | 2.073.600 | **~257.000** |
+| `0x80003f3600` (billig, gleiches Grid) | 0,55 | 8.294.400 | ~1.800 |
+
+Das Modul des Flaschenhalses hat **30.244 SPIR-V-Instruktionen**. ~89.000 Lane-Zyklen pro
+Invocation heißt, dass die Invocation grob in der Größenordnung des *ganzen* Moduls
+Arbeit leistet — bei 85 SPIR-V-Words pro Guest-Instruktion, 34 % Masken-Ops und der
+1,90x-Verdopplung durch wave64-auf-32. Die Zahl ist eine Schätzung (volle Occupancy
+unterstellt, Stalls ignoriert), aber sie sagt: es braucht **keinen** weiteren
+Speichermechanismus, um 27,6 ms zu erklären. Der emittierte Code reicht dafür aus.
+
+**Das widerspricht nicht dem früheren Ausschluss der Codegröße** — der verglich
+*Modulgrößen* zwischen Programmen (`0x8000269d00` hat 5,4x mehr Code und kostet 27x
+weniger). Modulgröße ist kein Maß für *ausgeführte* Instruktionen. Genau das fehlt und ist
+die nächste Messung:
+
+1. **Ausgeführte Instruktionen statt Modulgröße.** Trip-Counts der acht Schleifen des
+   Flaschenhalses (Hauptschleife `[9..29]`, 21 Blöcke, 164 Instruktionen) gegen die der
+   billigen Pässe. Ohne das ist jede Aussage über „zu viel Code" unbelegt.
+2. **Das erste echte Hebel-A/B:** `APS5_SINGLE_LANE=all` schaltet `laneCount` auf 1 und
+   halbiert den Code (131.449 → 69.258 Words). Das ist semantisch nur für
+   subgroup-unabhängige Programme korrekt, aber als *Messung* beantwortet es die Frage,
+   wie viel der 27,6 ms die Wave64-Emulation kostet. Vorher war der Lauf wertlos, weil
+   PCIe dominierte; jetzt nicht mehr.
+3. **Erst danach** der Lookup pro Zugriff (`get_bda_pointer`, nicht inlinebare Binärsuche
+   über die Range-Tabelle). Er bleibt ein Kandidat — 16 `read_bda_span`-Stellen und 8
+   `get_bda_pointer` im Modul —, aber die Speichertraffic läuft bei diesem Shader über das
+   Deskriptor-Array (714 `OpLoad`, 522 `OpAccessChain`), nicht über Zeiger.
+
+## Der Frame besteht nicht aus einem Shader
+
+Das 71-%-Bild vom 12.10. war eine Artefakt der Zählung: es verglich nur die
+*Programm*-Zeiten untereinander. Die `by class`-Zeile derselben Läufe zeigt den ganzen
+Frame. Lauf B, 8.340 ms Ranges auf 83 Presents = **100 ms pro Frame**:
+
+| Posten | pro Present | Anteil | Bytes pro Present |
+|---|---|---|---|
+| `0x800038be00` | 27,6 ms | 28 % | — |
+| `0x80003e8700` | 19,8 ms | 20 % | — |
+| `draw` | **18,4 ms** | 18 % | — |
+| `storage-writeback` | **13,9 ms** | 14 % | **375 MiB** |
+| `storage-upload` | **10,1 ms** | 10 % | **347 MiB** |
+| zehn weitere Programme | 6,7 ms | 7 % | — |
+| Staging (in + out) | 2,3 ms | 2 % | 88 MiB |
+| `fill`, `fill-clear`, `dcc-*`, `present-blit` | 1,2 ms | 1 % | 310 MiB |
+
+**721 MiB pro Present** wandern durch `storage-upload` und `storage-writeback`, 31 bzw.
+43 Mal pro Present, für zusammen **24 ms = ein Viertel des Frames**. Das ist so groß wie
+der Flaschenhals, den wir den ganzen Tag jagen, und bisher völlig unangetastet. Es ist
+dieselbe Mechanik, die CPU-seitig als `B images` 581 s kostet.
+
+Dazu 18,4 ms `draw` pro Present — auch das nie untersucht.
+
+**Reihenfolge der Fronten** ist damit neu zu bewerten: der Rest des Flaschenhalses
+(27,6 ms) ist der größte Einzelposten, aber Storage-Image-Traffic plus Draws sind
+zusammen 42 ms und damit die größere Hälfte des Frames.
 
 ## Upstream-Abgleich (Stand 13.10.)
 
@@ -565,8 +622,10 @@ python tools/spirv_stats.py  <modul>.spv             # Größe, Blöcke, Opcodes
 python tools/cfg_summary.py  cfg.txt                 # Back-Edges und Schleifenkörper
 ```
 
-`agc_shader_replay` braucht `libc.prx` im `PATH`
-(`build/core/libs/libs/unpatched`). `--cfg` gibt pro Block `words=` aus — das ist
+`agc_shader_replay` braucht **beide** Verzeichnisse im `PATH`, sonst startet es mit
+`0xC0000135` nicht: `build/core/libs/libs/unpatched` (für `libc.prx` und `libkernel.prx`)
+**und** das MinGW-`bin` der Toolchain (für `libstdc++-6.dll`, `libwinpthread-1.dll`).
+`--spv` schreibt `shader_<adresse>.req.spv` neben die Eingabe. `--cfg` gibt pro Block `words=` aus — das ist
 `estimatedSpirvWords`, eine **Heuristik** des Structurizers (`GraphBuilder.cpp:19`),
 keine Messung des Ergebnisses; echte Größen nur über `--spv` und `spirv_stats.py`.
 
@@ -584,7 +643,8 @@ das in `stagingEligible` das Staging blockiert.
 
 Die Rohdaten liegen unter `_analytics/` (gitignored, nicht im Repo):
 `game_debug.log`, `shaders/shader_*.req`, `written_shadow_tests/`,
-`host_import_trace/`, `mem/`.
+`host_import_trace/`, `mem/`, `no_host_import_tests/`, `carve_out_tests/`
+(Läufe A/B/C/D des Carve-outs).
 
 ## Referenz: Kostenverteilung CPU-Seite
 
