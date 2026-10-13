@@ -20,24 +20,28 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: der Titel kommt nicht aus der Initialisierung, fps warten
+## Vorrang: der Titel läuft, kommt aber über eine Stufe nicht hinaus
 
-> **Gemessen, nicht vermutet** (Hang-Dumps unter `_analytics/menu_blocker/`): der
-> Hauptthread wartet in keinem OS-Primitiv, sondern dreht in einer rdtsc-getakteten
-> Polling-Schleife auf einen Fortschrittszähler (`[rax+rcx*8]` gegen `r15`,
-> `GhostOfYotei.exe+0xdf3ec2`). **20 JobWorker schlafen** in `sceKernelWaitSema`, **kein**
-> Thread steht in einem HLE-Modul, Savedata ist mit drei `SCE_OK`-Aufrufen in den ersten
-> zwei Sekunden erledigt, und die **präsentierten Frames sind komplett schwarz**. Der
-> Ladekreisel kommt also nicht aus dem Framebuffer des Spiels.
+> **Kein Deadlock.** Die Hang-Dumps mit Registern (`_analytics/menu_blocker/`) zeigen `r15`
+> = 1896 bei 240 s und 5140 bei 600 s: **+9,01 pro Sekunde, exakt die Bildrate**. `r15` ist
+> der Frame-Zähler, und die rdtsc-Schleife bei `GhostOfYotei.exe+0xdf3ec2` ist **normales
+> Frame-Pacing** — der Hauptthread wartet auf den aktuellen GPU-Frame und steht dort über
+> 90 % der Zeit, weil ein leerer Frame 110–130 ms braucht. Die Lesart „wartet auf ein Signal"
+> ist mit dieser Begründung widerlegt.
 >
-> Damit ist auch klar, was wir den ganzen Tag optimiert haben: die Engine rendert ihre
-> **leere Welt** — 25 Draws und 12 Compute-Programme über nichts, Ergebnis schwarz. Die
-> fps-Operation unten bleibt gültig und **pausiert**; schneller leer bleibt leer.
+> **Fortschritt gibt es trotzdem nicht.** Über 600 s entstehen **29 Pipelines**, die letzte
+> neue im **zweiten von 58** Telemetriefenstern — danach **560 Sekunden ohne einen neuen
+> Shader**, bei 7 Dateizugriffen in 10 s, drei Savedata-Aufrufen am Anfang und 20 durchgehend
+> schlafenden JobWorkern. Ein stabiler Leerlauf: dieselben zwölf Programme über eine leere
+> Welt, Frame für Frame, ohne je eine weitere Stufe zu betreten.
 >
-> Nächster Schritt ist klein: `ReportAllThreads` gab nur `rip`/`rsp`/`rbp` aus, die
-> Integer-Register fehlten — und dort stehen die Adresse des Zählers und der Zielwert. Das
-> ist jetzt eingebaut, Auftrag in
-> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+> Die fps-Operation unten bleibt **pausiert**: solange der Titel die Stufe nicht verlässt,
+> bringt Tempo kein Menü. Nächster Schritt ist der Thread-Sampler
+> (`APS5_SAMPLE_THREADS`), der zeigt, was der Hauptthread in den anderen 10 % tut —
+> Auftrag in [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+>
+> **Werkzeugnotiz:** `APS5_WATCH_ADDR` lieferte 0 Treffer und beweist damit nichts — er
+> arbeitet über `VirtualProtect` und ist für GPU-DMA-Schreibzugriffe blind.
 
 ## Hier morgen weitermachen
 
