@@ -45,7 +45,8 @@ Kopien pro Present und ruhiger CPU-Seite — siehe
 [Carve-out](#der-carve-out-trägt-gemessen-24x-und-30--fps).
 
 **Hier weitermachen.** Vier Läufe sind durch (A/B/C/D, Logs in
-`_analytics/carve_out_tests/`), und sie haben die Front verschoben:
+`_analytics/carve_out_tests/`), und sie haben die Front verschoben. Der nächste Messauftrag
+steht in [`frame_cost_test_plan.md`](frame_cost_test_plan.md):
 
 1. **Der Rest des Flaschenhalses ist der emittierte Code, nicht ein Speichermechanismus.**
    27,6 ms mit vier Elementen device-lokal, 28,0 ms mit *allen* — PCIe ist zweifach
