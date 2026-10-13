@@ -70,12 +70,16 @@ add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/Conversion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/RelinkerPipeline.cpp
 )
+# Only the C++ sources: windres passes the include paths to the preprocessor unquoted, so a
+# source tree whose path contains a space breaks the resource compile of relinker.rc below (it
+# includes <winuser.h> alone and needs none of these). The generator expression keeps them out of
+# the RC language for this target and for everything that consumes it.
 target_include_directories(relinker_core PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/domain/include>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/io/include>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/codegen/include>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/relinker/include>"
 )
 
 target_compile_features(relinker_core PUBLIC cxx_std_20)
@@ -107,7 +111,10 @@ add_executable(relinker
     ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/NativeModules.cpp)
 target_link_libraries(relinker PRIVATE relinker_core)
-target_include_directories(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+target_include_directories(relinker PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/cli/include>"
+        "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/../libs>"
+)
 set_target_properties(relinker PROPERTIES CXX_EXTENSIONS OFF)
 
 if(BUILD_TESTING AND WIN32)
