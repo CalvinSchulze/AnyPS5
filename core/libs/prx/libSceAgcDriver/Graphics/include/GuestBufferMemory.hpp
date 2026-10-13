@@ -312,6 +312,10 @@ private:
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;
+        // The region was added inside a base region of the space that would otherwise have served
+        // it (addDescriptorRegion's BaseOverlap::Inside), so that it can be staged: AddressRanges
+        // subtracts its span from the base ranges, keeping the published table disjoint.
+        bool carvedOut = false;
         // The gpuCopy buffer is a device-local staging shadow (see stagingEligible): no host
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
@@ -357,6 +361,10 @@ private:
     // instead of the CPU (see Region::gpuCopy): live guest bytes, not sparse, at most the size
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.
     bool gpuCopyEligible(const Region& region) const;
+    // Whether a swept written element inside a base region of the space is carved out of it so it
+    // can be staged (see addDescriptorRegion): staging allowed and enabled, the carve-out not
+    // turned off by APS5_NO_ADDRESSABLE_STAGING, and a size within the swept window.
+    bool carveOutEligible(std::uint64_t begin, std::uint64_t end, bool swept) const;
     // Whether a region inside a host import is staged in device memory instead of bound in place
     // (see GuestBufferMemory.cpp): staging allowed, not address-based, a written element inside,
     // and an atomic element or a size within the written-shadow window. Independent of the import,
