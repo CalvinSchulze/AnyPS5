@@ -10,6 +10,8 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <limits>
 #include <stdexcept>
@@ -148,6 +150,32 @@ int APS5_VABI sceKernelClose(int d) {
     return 0;
 }
 
+namespace {
+
+// See File.hpp: the counters behind APS5_TRACE_FILEIO.
+std::atomic<std::uint64_t> g_fileReadCalls{0};
+std::atomic<std::uint64_t> g_fileReadBytes{0};
+std::atomic<std::int64_t> g_fileReadReported{0};
+
+const bool g_fileReadTrace = [] {
+    const bool on = std::getenv("APS5_TRACE_FILEIO") != nullptr;
+    if (on) std::fprintf(stderr, "[fileio] tracing enabled\n");
+    return on;
+}();
+
+}
+
+void NoteFileRead_nid_no_patch(std::int64_t bytes) {
+    if (!g_fileReadTrace) return;
+    const auto calls = g_fileReadCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto total = g_fileReadBytes.fetch_add(bytes > 0 ? static_cast<std::uint64_t>(bytes) : 0u, std::memory_order_relaxed) + (bytes > 0 ? static_cast<std::uint64_t>(bytes) : 0u);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto reported = g_fileReadReported.load(std::memory_order_relaxed);
+    if (reported != 0 && now - reported < 5000) return;
+    if (!g_fileReadReported.compare_exchange_strong(reported, now)) return;
+    std::fprintf(stderr, "[fileio] %llu read calls, %.1f MiB\n", static_cast<unsigned long long>(calls), total / 1048576.0);
+}
+
 std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     if (d >= GuestSockets::FirstDescriptor) {
         const auto n = GuestSockets::Read(d, buf, nbytes);
@@ -163,6 +191,7 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
+    NoteFileRead_nid_no_patch(static_cast<std::int64_t>(n));
     return static_cast<std::int64_t>(n);
 }
 

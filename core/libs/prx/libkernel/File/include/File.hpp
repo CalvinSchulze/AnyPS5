@@ -19,6 +19,12 @@ int APS5_VABI sceKernelUnlink(const char* path);
 #ifdef _WIN32
 std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_t nbytes, std::int64_t offset, bool write);
 #endif
+// APS5_TRACE_FILEIO=1: counts the guest's file reads and the bytes they returned, and prints a
+// [fileio] line every five seconds. A title whose loading never finishes either reads nothing (it
+// never started) or a lot (it is slow), and the open log cannot tell the two apart: a game opens
+// its archives once and then reads inside them, so counting opens says nothing about progress.
+// Counting only, no other effect. "[fileio] tracing enabled" at startup shows the switch took.
+void NoteFileRead_nid_no_patch(std::int64_t bytes);
 
 }
 

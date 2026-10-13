@@ -655,6 +655,7 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
     const auto result = NativePread(d, buf, nbytes, offset);
+    NoteFileRead_nid_no_patch(result);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
