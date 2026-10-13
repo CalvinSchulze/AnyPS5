@@ -20,34 +20,49 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: die Filmwiedergabe stockt — und 9 fps sind der Hauptverdächtige
+## Vorrang: der Titel hört nach dem Intro auf, überhaupt etwas zu verlangen
 
-> **Der Anzeigepfad ist gesund, und die schwarzen Frames waren ein Messfehler von mir.**
-> `[flip]` aus `VulkanDevice.cpp:2271` zeigt **1931 Presents aus dem residenten Image**,
-> 1 „unsuitable", 0 „not pending". Das Bild kommt also aus dem device-lokalen Image, das die
-> GPU bemalt. Und die 30 schwarzen Frame-Dumps lagen bei Present 10 bis 300, also in den
-> **ersten ~33 Sekunden** — der Film startet erst bei Logzeile ~4050, nach ~40 s. Wir haben
-> schwarz gemessen, weil wir vor dem Film geschaut haben. Dreimal darauf aufgebaut, dreimal
-> umsonst.
+> **Geschwindigkeit ist es nicht.** `APS5_TIME_SCALE=0.3` und `=0.15` verlangsamen die
+> Gast-Uhren um 3,3x bzw. 6,7x — die Zahlen sind **identisch**: 452 bzw. 455 Bilder, 1098
+> bzw. 1099 Leseaufrufe, 9,0 MiB, **29 Pipelines** in allen Läufen. Damit ist auch die
+> „Film-Pipeline läuft bei 9 fps über"-Erklärung tot.
 >
-> **Mein `[flip]`-Hook in `libSceVideoOut` feuerte nie:** der Titel flippt nicht über
-> `sceVideoOutSubmitFlip`, sondern über den **PM4-Flip-Paketpfad** des AGC-Treibers (passend
-> zu `flip x82` in den `[packets]`-Zeilen). Das Instrument saß im falschen Modul.
+> **Und es stockt nicht, es endet.** Über fünf Läufe immer dieselbe Marke: ~455 Bilder,
+> ~9,0 MiB, 29 Pipelines. Das ist **deterministisch**, also das Ende des Films
+> (455 Bilder = 15 s bei 30 fps, 9 MiB H.264 bei 1080p passt dazu). Mein „stockt an
+> wechselnder Stelle" beruhte darauf, dass ein früherer Lauf nur eher endete als sein
+> nächster Fünf-Sekunden-Bericht.
 >
-> **Was bleibt:** die Filmwiedergabe **stockt** an wechselnder Stelle (152 Bilder im einen
-> Lauf, 455 im nächsten) und wird **nie abgebaut** (0 flushes, 0 deletes). Danach keine
-> Lesevorgänge mehr, keine neuen Shader, Worker im Leerlauf.
+> **Der Titel fragt danach nichts mehr an.** `sceKernelOpen` loggt **vor** dem Versuch, also
+> auch Fehlschläge: es sind **7 Versuche im ganzen Lauf** (`t26344.dat`, `playgo.pgm`,
+> `save_icon.png`, `noloc.larc` 4x) und danach keiner mehr. Keine fehlende Datei — er fragt
+> gar nicht. Ebenso: keine Lesevorgänge, keine neuen Shader, Worker im Leerlauf.
 >
-> **Der Hauptverdächtige ist jetzt die Geschwindigkeit selbst.** Der Titel läuft mit ~9 fps
-> und erwartet 30 oder 60 — ein 30-fps-Film lässt sich bei 9 fps nicht abfließen, die
-> Warteschlange füllt sich, und der Titel wartet auf ein Ende, das nie kommt. Das wäre eine
-> mundane und vollständige Erklärung, und sie verbindet beide Baustellen: dann **ist** die
-> fps-Arbeit der Weg zum Menü.
+> ### Was damit alles ausgeschlossen ist
 >
-> **Der Test braucht keinen Build:** `APS5_TIME_SCALE=<faktor>` verlangsamt die Gast-Uhren
-> (`libkernel/Time/Time.cpp:57`), damit der Titel „plausible frame times" sieht. 0,3 ≈ ein
-> 30-fps-Takt, 0,15 ≈ 60. Kommt der Film damit durch, ist die Frage beantwortet. Auftrag:
-> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md); Prognose für die fps-Seite in
+> | Ausgeschlossen | Womit |
+> |---|---|
+> | Deadlock | `r15` steigt mit der Bildrate |
+> | GPU-Fences | alle bewarteten Slots laufen mit, zwei Strides bestätigen es |
+> | HLE-Thread blockiert | kein Thread in einem unserer Module außer idle |
+> | Savedata | 3 Aufrufe, alle `SCE_OK`, dann nichts |
+> | PlayGo | 36 Chunks, alles als installiert gemeldet |
+> | System-Event-Pumpe | **0** Aufrufe von `sceSystemServiceReceiveEvent` |
+> | AIO hängt | `Aio.cpp` ist synchron, setzt immer `AioCompleted` |
+> | Flip-/Vblank-Events | `triggerEvents` läuft pro Vblank |
+> | Video-Dekodierung | 455 von 457 Aufrufen geben 1920x1080 zurück |
+> | Anzeigepfad | 1931 Presents aus dem residenten Image, 1 unsuitable |
+> | fehlende Datei | alle 7 Open-Versuche protokolliert, keiner scheitert |
+> | Geschwindigkeit | `TIME_SCALE` 0,3 und 0,15 ändern nichts |
+>
+> **Die Methode ist am Ende, nicht die Spur.** Was bleibt, liegt in der Logik des Titels und
+> hängt an einer Antwort, die wir still falsch geben. Um das zu sehen, bräuchte es einen
+> **Aufrufzähler über alle HLE-Exporte** — den gibt es nicht, und er verlangt einen Eingriff
+> in den NID-Patcher. Die billigere Alternative ist ein **Vergleichstitel**, der sein Menü
+> erreicht: der Unterschied im Aufrufmuster zeigt die Lücke schneller als jedes weitere
+> Einzelinstrument.
+>
+> Die fps-Operation unten ist davon unabhängig und bleibt gültig; Prognose in
 > [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
 
 ## Hier morgen weitermachen
