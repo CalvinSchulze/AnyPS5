@@ -18,7 +18,9 @@ Konkret heißt das:
 
 ## Bauen und Deployen: ja, nötig
 
-Dieser Auftrag braucht einen **neuen Build**, weil der Schalter aus Lauf 1 neu ist.
+Dieser Auftrag braucht einen **neuen Build**, weil der Schalter aus Lauf 1 neu ist. Lauf 3
+braucht ihn nicht, benutzt aber denselben Build — die Reihenfolge ist egal, **Lauf 3 ist
+der wichtigere**, falls die Zeit nur für einen reicht.
 
 **Was zu bauen ist:** `libc.prx` — der Dump sitzt in
 `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp`.
@@ -106,11 +108,38 @@ Disassembly eine andere Bedeutung haben, zeigt dieser Lauf die Werte dicht an di
 
 **Zu berichten:** erste und letzte Zeile wörtlich, dazu dieselbe Tabelle wie oben.
 
+## Lauf 3 — Bild gegen Ton (neu, und vorrangig)
+
+**Neue Beobachtung von außen:** während der Läufe ist der **Ton der Start-Animationen
+hörbar**. Der Titel produziert also Inhalt, während die präsentierten Frames komplett
+schwarz waren. Damit ist Schwarz nicht mehr erwartbar, sondern verdächtig, und der
+Frame-Dump ist **doch** zu wiederholen — diesmal dichter und zusammen mit den
+Render-Targets.
+
+```
+APS5_DUMP_FRAMES=30 APS5_DUMP_FRAMES_EVERY=10 APS5_DUMP_SCALE=4 APS5_DUMP_TARGETS=12 APS5_TRACE_VIDEODEC=1 .pp.exe
+```
+
+Mindestens **drei Minuten**, damit die Animationen durchlaufen.
+
+**Zu berichten:**
+
+1. Pro `frame_*.bmp`: **Max-Wert je Kanal** (R, G, B) und ob er von 0 verschieden ist.
+   Eine Zeile pro Datei, keine Deutung.
+2. Dasselbe für die Target-Dumps: Datei, Breite x Höhe, `VkFormat`, Max je Kanal.
+3. **Alle** `[videodec2]`-Zeilen wörtlich. Falls keine erscheint: genau das schreiben.
+4. Die Zahl der `[videoout]`- und `flip`-Zeilen, falls vorhanden.
+
+**Eine Falle vorweg, damit sie nicht als Befund auftaucht:** die `[videodec2] Decode`-Zeile
+ist im Code auf die **ersten drei** Dekodierungen begrenzt (`decoder.decoded < 3`). Drei
+Zeilen heißen also **nicht**, dass nur drei Frames dekodiert wurden. Die
+`Query...`/`Allocate...`-Zeilen kommen dagegen pro Aufruf.
+
 ## Was nicht zu tun ist
 
 - **Nicht** interpretieren (siehe oben).
-- **Nicht** erneut Hang-Dumps, Frame-Dumps, `WATCH_ADDR` oder den Sampler fahren — alle vier
-  sind durch.
+- **Nicht** erneut Hang-Dumps, `WATCH_ADDR` oder den Sampler fahren — die drei sind durch.
+  (Der Frame-Dump ist wegen der Ton-Beobachtung **wieder** dabei, siehe Lauf 3.)
 - **Nicht** an fps arbeiten.
 - **Keinen** Code ändern.
 

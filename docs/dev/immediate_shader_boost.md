@@ -44,6 +44,15 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 > pollt. Ein Aufruf unter einer Mikrosekunde, einmal pro Frame, erzeugt bei 2-ms-Sampling
 > über 2.900 Frames null bis ein Sample. Das Fehlen von PRX-Samples beweist nichts.
 >
+> **Beobachtung von außen, die eine Annahme kippt:** während der Läufe ist der **Ton der
+> Start-Animationen hörbar**. Der Titel produziert also Inhalt, während die präsentierten
+> Frames komplett schwarz sind. „Rendert eine leere Welt" ist damit nicht mehr die einzige
+> Lesart — genauso möglich ist, dass Inhalt entsteht und auf dem Weg zum Bildschirm
+> verloren geht. Der Frame-Dump ist deshalb **wieder** im Auftrag, diesmal dichter und
+> zusammen mit den Render-Targets und `APS5_TRACE_VIDEODEC`: Targets mit Inhalt bei
+> schwarzem Present wären ein Kompositionsfehler, beides schwarz hieße, dass der Ton aus
+> einem unabhängigen Pfad kommt.
+>
 > Die fps-Operation unten bleibt pausiert; die Prognose dazu steht in
 > [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
 
