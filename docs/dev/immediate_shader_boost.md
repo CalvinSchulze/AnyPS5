@@ -20,28 +20,32 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: der Titel läuft, kommt aber über eine Stufe nicht hinaus
+## Vorrang: fünf Spin-Schleifen auf ein Fence-Array, eine Stufe wird nie verlassen
 
-> **Kein Deadlock.** Die Hang-Dumps mit Registern (`_analytics/menu_blocker/`) zeigen `r15`
-> = 1896 bei 240 s und 5140 bei 600 s: **+9,01 pro Sekunde, exakt die Bildrate**. `r15` ist
-> der Frame-Zähler, und die rdtsc-Schleife bei `GhostOfYotei.exe+0xdf3ec2` ist **normales
-> Frame-Pacing** — der Hauptthread wartet auf den aktuellen GPU-Frame und steht dort über
-> 90 % der Zeit, weil ein leerer Frame 110–130 ms braucht. Die Lesart „wartet auf ein Signal"
-> ist mit dieser Begründung widerlegt.
+> **Kein Deadlock, kein Fortschritt.** `r15` steigt mit 9,01/s (die Bildrate), der Titel
+> rendert also ordentlich — aber über 600 s entstehen 29 Pipelines, die letzte im **zweiten
+> von 58** Telemetriefenstern, bei 7 Dateizugriffen in 10 s und durchgehend schlafenden
+> JobWorkern. Stationärer Leerlauf.
 >
-> **Fortschritt gibt es trotzdem nicht.** Über 600 s entstehen **29 Pipelines**, die letzte
-> neue im **zweiten von 58** Telemetriefenstern — danach **560 Sekunden ohne einen neuen
-> Shader**, bei 7 Dateizugriffen in 10 s, drei Savedata-Aufrufen am Anfang und 20 durchgehend
-> schlafenden JobWorkern. Ein stabiler Leerlauf: dieselben zwölf Programme über eine leere
-> Welt, Frame für Frame, ohne je eine weitere Stufe zu betreten.
+> **Der Sampler-Lauf (320 s, 18.806 Runden) zeigt:** der Hauptthread verbringt **97,4 %**
+> seiner Zeit in **fünf** rdtsc-Spin-Schleifen, die alle auf dasselbe Fence-Array
+> (`[0x14465afe8]` → `0x2000000000`) warten — `0xdf3ec2` 70,5 %, `0x125bc42` 17,1 %,
+> `0xdf4a40` 4,4 %, `0xeb74e0` 2,8 %, `0xdf4060` 2,6 %. Über 15 Blöcke à 20 s ändert sich
+> nichts.
 >
-> Die fps-Operation unten bleibt **pausiert**: solange der Titel die Stufe nicht verlässt,
-> bringt Tempo kein Menü. Nächster Schritt ist der Thread-Sampler
-> (`APS5_SAMPLE_THREADS`), der zeigt, was der Hauptthread in den anderen 10 % tut —
-> Auftrag in [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+> **Die offene Frage:** der Sampler zeigt, *wo* gewartet wird, nicht *worauf*. Fünf
+> Schleifen auf einem Array mit 32 Byte pro Slot heißt möglicherweise fünf verschiedene
+> Slots — zählt einer nie hoch, wartet das Spiel auf eine Vollzugsmeldung, die nie kommt.
+> Dafür ist `APS5_DUMP_GUEST=<hex>[:<count>[:<stride>]]` neu eingebaut: alle zwei Sekunden
+> die Werte, mit `*` für die, die sich geändert haben. Auftrag:
+> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
 >
-> **Werkzeugnotiz:** `APS5_WATCH_ADDR` lieferte 0 Treffer und beweist damit nichts — er
-> arbeitet über `VirtualProtect` und ist für GPU-DMA-Schreibzugriffe blind.
+> **Nicht gezeigt, auch wenn es so berichtet wurde:** dass der Titel keine HLE-Funktion
+> pollt. Ein Aufruf unter einer Mikrosekunde, einmal pro Frame, erzeugt bei 2-ms-Sampling
+> über 2.900 Frames null bis ein Sample. Das Fehlen von PRX-Samples beweist nichts.
+>
+> Die fps-Operation unten bleibt pausiert; die Prognose dazu steht in
+> [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
 
 ## Hier morgen weitermachen
 

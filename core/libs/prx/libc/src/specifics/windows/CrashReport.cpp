@@ -142,6 +142,54 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+// APS5_DUMP_GUEST=<hex address>[:<count>[:<stride>]] prints `count` 64-bit words from that
+// guest address every two seconds, `stride` bytes apart (default 16 words, 8 bytes apart), and
+// marks with a star the ones that changed since the previous print. A title spinning on a fence
+// array shows at a glance which slot advances and which stands still, which neither the sampler
+// (it sees where the code waits, not what it waits for) nor APS5_WATCH_ADDR (blind to GPU DMA)
+// can answer. Read-only: it never writes guest memory and never protects a page.
+void InstallGuestDump() {
+    const char* text = std::getenv("APS5_DUMP_GUEST");
+    if (text == nullptr) return;
+    char* end = nullptr;
+    const auto address = std::strtoull(text, &end, 16);
+    unsigned long long count = 16;
+    unsigned long long stride = 8;
+    if (end != nullptr && *end == 58) count = std::strtoull(end + 1, &end, 10);
+    if (end != nullptr && *end == 58) stride = std::strtoull(end + 1, &end, 10);
+    if (address == 0 || count == 0) return;
+    if (count > 24) count = 24;
+    if (stride < 8) stride = 8;
+    struct Request { std::uint64_t address, count, stride; };
+    static Request request{address, count, stride};
+    CreateThread(nullptr, 0, [](void* parameter) -> DWORD {
+        const auto& request = *static_cast<const Request*>(parameter);
+        std::uint64_t previous[24] = {};
+        bool first = true;
+        for (;;) {
+            MEMORY_BASIC_INFORMATION memory{};
+            const auto last = request.address + (request.count - 1) * request.stride;
+            const bool ready = VirtualQuery(reinterpret_cast<const void*>(request.address), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT &&
+                VirtualQuery(reinterpret_cast<const void*>(last), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT;
+            if (!ready) {
+                Sleep(200);
+                continue;
+            }
+            char line[960];
+            int length = std::snprintf(line, sizeof(line), "[guestdump] 0x%llx stride %llu:", static_cast<unsigned long long>(request.address), static_cast<unsigned long long>(request.stride));
+            for (std::uint64_t slot = 0; slot < request.count && length > 0 && length < static_cast<int>(sizeof(line)) - 40; ++slot) {
+                const auto value = *reinterpret_cast<const volatile std::uint64_t*>(request.address + slot * request.stride);
+                const bool changed = !first && value != previous[slot];
+                length += std::snprintf(line + length, sizeof(line) - length, " %llu=%llu%s", static_cast<unsigned long long>(slot), static_cast<unsigned long long>(value), changed ? "*" : "");
+                previous[slot] = value;
+            }
+            first = false;
+            Report("%s\n", line);
+            Sleep(2000);
+        }
+    }, &request, 0, nullptr);
+}
+
 void InstallWatch() {
     // APS5_WATCH_ADDR=<absolute hex address> watches guest data that is mapped later: the page is
     // protected once it has been committed.
@@ -479,6 +527,7 @@ const bool g_crashReportInstalled = [] {
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
+    InstallGuestDump();
     if (const char* hang = std::getenv("APS5_HANG_DUMP_SECS")) {
         unsigned long long seconds = 0;
         if (hang[0] >= '0' && hang[0] <= '9') {
