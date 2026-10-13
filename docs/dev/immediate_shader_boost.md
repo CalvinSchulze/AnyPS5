@@ -49,13 +49,13 @@ Kopien pro Present und ruhiger CPU-Seite — siehe
 100 ms: 27,6 ms Flaschenhals, 19,8 ms zweiter Shader, 18,4 ms `draw`, 24 ms
 Storage-Image-Traffic.
 
-1. **Die Front ist der Storage-Image-Pingpong, und sie ist jetzt belegt und lokalisiert.**
-   `cpuWrote` ist für alle drei Haupt-Targets zu **100 % 0**, zwei davon werden zweimal pro
-   Present hoch- und zurückgeschrieben, ohne dass CPU, Dirty-Flag oder DCC-Keys beteiligt
-   sind. Der Ausweg existiert (`Texture.cpp:1424`), ist aber durch `originalValid = false`
-   an `:1739` und `:2806` abgeschaltet. Obergrenze: **+48 % fps**. Nächster Schritt ist
-   **bauen**, nicht messen — Richtung unter
-   [Pingpong](#die-größte-front-der-storage-image-pingpong--belegt-und-lokalisiert).
+1. **Die Front ist der Storage-Image-Round-Trip, und die Ursache ist jetzt benannt:**
+   dieselbe Rendertarget-Fläche ist in einem Frame getiledes **Image** und linearer
+   **Gast-Buffer** — `0x80003e8700` bindet sie als Buffer. Daraus folgen 2 Write-backs und
+   2 Uploads pro Present und Fläche, 93 % aller Write-backs mit `reason=storage refresh`.
+   Obergrenze des Hebels: **+48 % fps**. Nächster Schritt ist eine **Codelesung** (warum
+   `settle()` den Re-Upload nicht verhindert), dann eine Entwurfsentscheidung — siehe
+   [Round-Trip](#die-ursache-dieselbe-fläche-ist-image-und-gast-buffer).
 2. **Die Codemenge ist als Hebel erledigt**, in beide Richtungen: `SPIRV_OPT=full` bringt
    1,4 %, `SINGLE_LANE` auf ein Programm kostet **+94 %** (symmetrisch für beide Shader).
    Zwei Lanes sind das Optimum, nicht Ballast. Siehe
@@ -548,7 +548,7 @@ Der dritte ist eine gebrochene SSA-Invariante, also ein echter Defekt auf dem
 `laneCount=1`-Pfad — notierenswert, aber kein Blocker: die Adressform des Schalters
 umgeht ihn.
 
-## Die größte Front: der Storage-Image-Pingpong — belegt und lokalisiert
+## Die größte Front: der Storage-Image-Round-Trip
 
 `APS5_GPU_NO_WRITEBACK=1` als Obergrenze gemessen, und sie ist groß:
 
@@ -564,64 +564,75 @@ umgeht ihn.
 Der Write-back kostet nicht nur sich selbst: er halbiert die **Uploads** und drittelt die
 **Draws**. Zusammen ~27 ms pro Frame. Die heißen Dispatches rühren sich nicht.
 
-### Die Messung: `cpuWrote` ist zu 100 % 0
+### Die Messung, und wohin sie wirklich zeigt
 
-`APS5_CAPTURE_TRACE=1` liefert die Zeile, die die Entscheidung trägt. 5.716
-`refresh`-Ereignisse über 152 Presents, **37,6 pro Present**, dazu 36,8 Uploads und 43,2
-Write-backs pro Present. Global: `cpuWrote` in **95,7 %** der Fälle 0, `dirty` in 80,9 %,
-`keysChanged` in 86,5 %.
+`APS5_CAPTURE_TRACE=1`: 5.716 `refresh`-Ereignisse über 152 Presents (37,6 pro Present),
+36,8 Uploads und 43,2 Write-backs pro Present. `cpuWrote` ist in 95,7 % der Fälle 0, für
+die drei Haupt-Targets in **100 %**. Zwei 1920x1080-Flächen werden **zweimal pro Present**
+hoch- und zurückgeschrieben, ohne CPU, ohne Dirty-Flag, ohne Key-Änderung.
 
-Für die drei Haupt-Targets, die sich in 151 von 152 Presents wiederholen:
+**Damit war meine erste Lesart falsch** — und die naheliegende zweite auch. Es ist nicht
+„der Treiber hält seine eigenen Write-backs für Gast-Änderungen", und es ist auch kein
+Pingpong zwischen zwei Images. Die Trace-Zeilen tragen ein `reason=`-Feld, und das sagt es:
 
-| Ziel | Auflösung | refresh/Present | up/back pro Present | `cpuWrote=0` | `dirty=0` | `keysChanged=0` |
-|---|---|---|---|---|---|---|
-| `0x5000860000` | 3840x2160 (~32 MiB) | 2,90 | 0,99 / 0,04 | **100 %** | 68,5 % | 67,3 % |
-| `0x50727e0000` | 1920x1080 (~8 MiB) | 1,99 | 2,00 / 1,99 | **100 %** | **100 %** | **100 %** |
-| `0x5060d30000` | 1920x1080 (~8 MiB) | 1,99 | 2,00 / 1,99 | **100 %** | **100 %** | **100 %** |
+- **93 % der Write-backs:** `reason=storage refresh` — ausgelöst von `FlushPending` im
+  Refresh (`Texture.cpp:1335`), nicht von einer Änderungserkennung.
+- **93 % der Uploads:** `reason=flushed` (`:1552`) — also *weil* eben geflusht wurde.
 
-Zwei Targets werden **zweimal pro Present** hochgeladen und zweimal zurückgeschrieben,
-obwohl weder die CPU sie anfasst, noch sie schmutzig sind, noch die DCC-Keys sich ändern.
-`generation` steigt jeden Present.
+Und die Sequenz im Log lässt keinen Zweifel, es ist **dasselbe Image** innerhalb von
+Mikrosekunden:
 
-### Die Ursache, auf drei Zeilen
-
-Es gibt einen Ausweg, und er ist abgeschaltet. `Texture.cpp:1424`:
-
-```cpp
-if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
-    unchanged = true;   // Gastspeicher gleicht noch `original` -> kein Upload
+```
+writeback  image=50727e0000 reason=storage refresh units=135
+buffer-write batch=100 address=50727e0000 bytes=8847360 label=0
+refresh    image=50727e0000 dirty=0 keysChanged=0 cpuWrote=0
+upload     image=50727e0000 reason=flushed partial=1
+buffer-read  batch=100 address=50727e0000 bytes=8847360 kind=4
 ```
 
-`original` hält laut Kommentar „the guest bytes the image was last uploaded from **or
-written back as**". Genau dieser Vergleich würde den Pingpong abfangen — er verlangt aber
-`originalValid`, und das wird an zwei Stellen gelöscht:
+### Die Ursache: dieselbe Fläche ist Image **und** Gast-Buffer
 
-- `:1739` — im Host-Import-Pfad: `if (GuestMemory::Watched(...)) originalValid = false;`
-  Für ein Target unter Write-Watch gibt es also **nie** einen Baseline-Vergleich.
-- `:2806` — nach dem Write-back selbst, mit dem Kommentar *„the stamps make their next
-  Refresh re-upload, `original` no longer vouching for the bytes"*.
+Die beiden `buffer-write`/`buffer-read`-Zeilen (`Recorder.cpp:2518` / `:2684`) sind der
+Schlüssel: ein **Dispatch bindet den Rendertarget-Speicher als Gast-Buffer**, lesend *und*
+schreibend, über die vollen 8.847.360 Byte. Gezählt über den Lauf: **je 303 Writes und 304
+Reads auf jede der beiden Flächen = genau 2 pro Present**, exakt die Zahl der Uploads und
+Write-backs.
 
-Damit entscheidet allein die Block-Stempelung aus der Write-Watch, und die stempelt auch
-**unsere eigenen** Write-backs. Der Treiber kann seine Schreibzugriffe nicht von denen des
-Spiels unterscheiden, also lädt er zurück, was er selbst geschrieben hat. Der Trace zeigt
-genau das: `originalValid 0` im dominierenden Fall.
+Damit ist der Zyklus zwangsläufig:
 
-### Fix-Richtung
+1. Ein Dispatch meldet einen Schreibzugriff auf den Speicher **als Buffer**.
+2. Also müssen die GPU-Ergebnisse des **Images** vorher in den Gastspeicher — Write-back,
+   8 MiB durch den Detiler (`reason=storage refresh`).
+3. Danach wird das Image refreshed und neu hochgeladen — 8 MiB durch den Retiler
+   (`reason=flushed`), noch bevor der Dispatch läuft.
+4. Der Dispatch liest und schreibt die Bytes als Buffer.
 
-Der Weg führt **nicht** über `equalsOriginal()` — dafür müssten die zurückgeschriebenen
-Bytes auf der CPU liegen, und genau diesen Readback will man sich sparen. Richtig ist die
-stärkere Aussage: **eine Unit, deren Stempel nur vom eigenen Write-back kommen, ist nicht
-geändert** — das Image *ist* die Quelle dieser Bytes. Gebraucht wird also eine
-Pro-Block-Notiz „von uns zurückgeschrieben bei Generation G", gegen die
-`UnchangedSince` / `ChangedBlocks` prüfen kann. Bausteine sind da: `NoteShadowSeed` im
-Write-back-Pfad, `GuestMemory::StoredOver`, `cpuBlocks` getrennt von `stampedBlocks`.
+Zweimal pro Present, für zwei 8-MiB-Flächen plus das 32-MiB-4K-Target — das ist der
+Großteil der 721 MiB. Im selben Batch liest der Dispatch `0x5032280000+0x7e900`
+(518.400 B), einen der Buffer von **`0x80003e8700`**. Die beiden Fronten hängen also
+zusammen: der zweite heiße Shader ist derjenige, der die Targets als Buffer bindet.
 
-Die Schwierigkeit ist die Reihenfolge: die Stempel des Write-backs landen **asynchron**
-auf der GPU, die Notiz muss also die Generation *nach* dem Landen tragen — dafür ist die
-Pending-Results-Maschinerie (`layerPending`, `pendingChanged`) der Ankerpunkt.
+### Fix-Richtung: eine Entwurfsfrage, kein Zweizeiler
 
-**Kein Fix:** `APS5_GPU_NO_WRITEBACK=1` bricht die Korrektheit per Definition. 12,1 fps
-sind eine Obergrenze, keine Zielmarke.
+Die Umwandlung ist **echte Arbeit**, nicht Buchhaltung: das Image ist getiled, die
+Buffer-Sicht linear, und dazwischen laufen De- und Retiler. Solange dieselbe Fläche in
+einem Frame beides ist, ist der Transfer semantisch nötig. Zwei Richtungen, und beide sind
+größer als ein Patch:
+
+1. **Die Darstellung nach der Nutzung wählen.** Wird eine Fläche in einem Frame als
+   linearer Buffer geschrieben *und* gelesen, ist die getilede Image-Form für diesen Frame
+   überflüssig. Dann entfällt der Round-Trip ganz, statt ihn zu verbilligen.
+2. **Den Re-Upload nach dem eigenen Write-back sparen.** Direkt nach Schritt 2 hält der
+   Gastspeicher exakt den Image-Inhalt — der Upload in Schritt 3 liest zurück, was der
+   Treiber gerade selbst geschrieben hat, und zwar *bevor* der Dispatch etwas ändern konnte.
+   Das ist nachweisbar redundant. Offen ist, warum die Generationsfortschreibung in
+   `settle()` (`:3672`, sie zieht `layerGeneration` hinter die eigenen Stempel) das nicht
+   schon verhindert — das ist die **nächste Codelesung**, nicht die nächste Messung.
+
+**Nicht zu verwechseln:** `APS5_GPU_NO_WRITEBACK=1` wirkt, weil es `MarkDirty()` in
+`ShaderResources::MarkGpuWrites` überspringt — ohne Pending-Ergebnisse gibt es keinen
+Flush und damit auch keinen Re-Upload. Das erklärt die +48 %, bricht aber die Korrektheit
+per Definition. 12,1 fps sind eine Obergrenze, keine Zielmarke.
 
 ## Wave64-Emulation: Hypothese gefallen, 2 Lanes sind das Optimum
 
