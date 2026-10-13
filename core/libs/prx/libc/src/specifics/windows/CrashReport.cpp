@@ -358,6 +358,14 @@ void ReportThreadContext(const CONTEXT* context, DWORD threadId, const char* nam
     Report("  thread %lu '%s': rip ", static_cast<unsigned long>(threadId), name ? name : "");
     DescribeAddress(context->Rip, line, sizeof(line));
     Report("%s rsp 0x%016llx rbp 0x%016llx\n", line, static_cast<unsigned long long>(context->Rsp), static_cast<unsigned long long>(context->Rbp));
+    // The integer registers, two lines plus the tail, in the usual order. A thread spinning on
+    // a progress counter - a loading screen that never ends - holds the address it polls and the
+    // value it waits for in them, and the stack alone shows neither. Six per line keeps every
+    // line inside Report's buffer.
+    const auto hex = [](DWORD64 value) { return static_cast<unsigned long long>(value); };
+    Report("    rax 0x%016llx rbx 0x%016llx rcx 0x%016llx rdx 0x%016llx rsi 0x%016llx rdi 0x%016llx\n", hex(context->Rax), hex(context->Rbx), hex(context->Rcx), hex(context->Rdx), hex(context->Rsi), hex(context->Rdi));
+    Report("    r8  0x%016llx r9  0x%016llx r10 0x%016llx r11 0x%016llx r12 0x%016llx r13 0x%016llx\n", hex(context->R8), hex(context->R9), hex(context->R10), hex(context->R11), hex(context->R12), hex(context->R13));
+    Report("    r14 0x%016llx r15 0x%016llx\n", hex(context->R14), hex(context->R15));
     for (std::size_t depth = 0; depth < frameCount; ++depth) {
         DescribeAddress(frames[depth], line, sizeof(line));
         Report("    #%llu %s\n", static_cast<unsigned long long>(depth), line);

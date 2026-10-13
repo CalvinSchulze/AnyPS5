@@ -1,92 +1,97 @@
-# Messplan: worauf der Titel im Ladekreisel wartet
+# Messplan: welchen Zähler der Hauptthread pollt
 
-Ziel ist das **3D-Hauptmenü**. Beobachtung, die alles umstellt: über eine Stunde bei ~7 fps
-lief **95 % der Sitzung der Ladekreisel**, eine Szene war nie zu sehen. Das ist kein
-fps-Problem. Der Titel **wartet**, und dieser Plan findet heraus, auf was.
+Ziel ist das **3D-Hauptmenü**. Die erste Runde ist durch und hat das Bild vollständig
+gedreht. Logs unter `_analytics/menu_blocker/`.
 
-## Was die vorhandenen Logs schon ausschließen
+## Was Runde 1 ergeben hat
 
-Aus `_analytics/frame_cost_tests/lauf_1_pipeline_stats.log`:
+**Der Hauptthread wartet in keinem Betriebssystem-Primitiv.** Er dreht in einer
+rdtsc-getakteten Polling-Schleife (`GhostOfYotei.exe+0xdf3ec2`):
 
-- **Datei-IO ist es nicht.** In einem 10-s-Fenster gibt es **7** `sceKernelOpen`-Aufrufe,
-  und zwar `/app0/cache_ps5/loc/noloc.larc` (4x), `save_icon.png`, `t26344.dat`,
-  `playgo.pgm`. Ein Titel, der sein Menü lädt, würde hunderte Archive anfassen. Es wird
-  **nichts gestreamt**.
-- **PlayGo ist es nicht.** `[libScePlayGo] Loaded 36 chunks from
-  /app0/sce_sys/playgo-chunk.dat`, und die Implementierung meldet alles als installiert.
-- **Die GPU ist es nicht.** Sie rechnet einen vollen 3D-Frame: 25 Draws, 12
-  Compute-Programme, 19 Images pro Dispatch, 4K-Targets mit DCC, Froxel-Culling,
-  `fill-clear` über 140 MiB pro Present. 8,3 fps sind langsam, aber es läuft.
-- **Es scheitert nichts sichtbar.** Kein `not implemented`, kein `stub`, keine abgelehnten
-  Draws in irgendeinem Log.
+```
+140df3ed0: movsxd rcx, [r13+0xcc]   ; Index
+140df3ee2: mov    rcx, [rax+rcx*8]  ; Fortschrittszähler lesen
+140df3ee6: cmp    rcx, r15          ; gegen Zielwert
+140df3ee9: jl     0x140df3e90       ; nicht erreicht -> wieder von vorn
+```
 
-Bleibt: ein Thread wartet auf etwas, das nie kommt.
+Drum herum: **20 JobWorker schlafen** in `sceKernelWaitSema`, 6 Threads in
+`scePthreadCondWait`, 3 in `sceKernelWaitEqueue`. **Kein einziger Thread steht in einem
+HLE-Modul** — nicht in `libSceSaveData`, `libSceNp*`, `libSceSystemService`, `libSceAjm`,
+`libScePlayGo`.
 
-## Lauf 1 — der Hang-Dump (das Kernstück)
+**Savedata ist aus:** im ganzen 240-s-Lauf drei Aufrufe, alle in den ersten zwei Sekunden,
+alle mit `SCE_OK`, danach 238 Sekunden gar nichts.
+
+**Die präsentierten Frames sind komplett schwarz** (alle RGB 0, Alpha 255). Der Ladekreisel,
+den man sieht, steckt also **nicht** im Framebuffer des Spiels — er kommt von außerhalb.
+Damit ist auch klar, was die GPU die ganze Zeit rechnet: die Engine rendert ihre leere Welt,
+25 Draws und 12 Compute-Programme über nichts, Ergebnis schwarz.
+
+Das Gesamtbild ist konsistent: die Initialisierung kommt nicht über eine Stufe hinaus, die
+Worker haben nichts zu tun, der Render-Thread läuft trotzdem, und der Hauptthread wartet
+auf einen Zähler, den niemand hochzählt.
+
+## Was dafür neu im Build ist
+
+`ReportAllThreads` gab bisher nur `rip`, `rsp` und `rbp`. **Die Integer-Register fehlten** —
+und genau dort stehen die Adresse des Zählers und der Zielwert. Das ist jetzt drin
+(`CrashReport.cpp`, `libc.prx` ist neu gebaut): pro Thread drei Zeilen mit `rax`–`r15`.
+
+## Lauf 1 — Hang-Dump mit Registern
 
 ```
 APS5_HANG_DUMP_SECS=240 .pp.exe
 ```
 
-Der Schalter startet einen Watchdog, der nach n Sekunden **absichtlich abbricht** und dabei
-`ReportAllThreads()` ausführt: Backtraces **jedes** Threads. Der Abbruch ist der Zweck des
-Laufs, **kein** Fehler — bitte nicht als Absturz melden.
+**Zu notieren, nur für den Hauptthread** (der ohne Namen, dessen `rip` in
+`GhostOfYotei.exe+0xdf3ec2` oder in der Nähe steht):
 
-240 s heißt: der Kreisel soll schon eine Weile laufen, wenn es abbricht. Lieber einmal mit
-240 s und einmal mit 600 s, um zu sehen, ob sich die Wartepositionen **verändern** (dann
-läuft etwas, nur unendlich langsam) oder **gleich bleiben** (dann hängt es wirklich).
+- **`rax`** — die Basis des Zähler-Arrays. Das ist die wichtigste Zahl des Laufs.
+- **`r15`** — der Zielwert, auf den gewartet wird.
+- **`r13`** — der Struct-Zeiger, aus dem der Index kommt.
+- Dazu die ganze Registerzeile unverändert zitieren, nicht zusammenfassen.
 
-**Zu notieren — das ist das Ergebnis des Laufs:**
+**Die Adresse selbst beantwortet schon die halbe Frage:**
 
-- Für jeden Thread die obersten Frames, zusammengefasst nach **gleicher Warteposition**:
-  „N Threads in X". Nicht jeden Stack einzeln zitieren.
-- Besonders auf Warteprimitive achten: `sceKernelWaitEqueue`, `pthread_cond_wait`,
-  Semaphore, `sceKernelWaitEventFlag`, `sync_on_address`, Mutexe.
-- Welcher Thread sieht nach dem **Hauptthread** des Spiels aus, und wo steht er?
-- Steht ein Thread in einem unserer HLE-Module (`libSceSaveData`, `libSceNp*`,
-  `libSceSystemService`, `libSceVideoOut`, `libSceAjm`, `libScePlayGo`)? Dann ist das der
-  Kandidat, und der Name der Funktion ist die Antwort.
-- Dreht ein Thread in einer **Schleife** statt zu warten (hoher CPU-Verbrauch, wechselnde
-  Frames über zwei Dumps)? Dann pollt er auf eine Bedingung, die wir falsch melden.
+- Liegt `rax` in **`0x5000000000`–`0x50d5800000`**, ist es die Gast-Arena, also Speicher,
+  den die **GPU** schreiben kann — dann ist der Zähler sehr wahrscheinlich ein GPU-Label,
+  und die Frage wird, warum unser Label-Pfad ihn nicht hochzählt.
+- Liegt `rax` woanders (im Heap des Titels, `0x7ff6...` im Image), ist es CPU-Buchhaltung,
+  und ein anderer Gast-Thread müsste ihn schreiben.
 
-## Lauf 2 — Savedata, falls Lauf 1 dorthin zeigt (oder als Parallelprobe)
+Bitte **zweimal** laufen lassen, mit 240 s und mit 600 s, und `r15` sowie `rax` vergleichen:
+bleiben sie gleich, hängt es; verändern sie sich, kommt die Initialisierung stufenweise
+voran und ist nur unerträglich langsam.
 
-```
-APS5_SAVEDATA_TRACE=1 APS5_HANG_DUMP_SECS=240 .pp.exe
-```
+## Lauf 2 — wer schreibt diese Adresse?
 
-`APS5_SAVEDATA_TRACE=1` hebt das Limit der Savedata-Protokollierung auf (ohne ihn werden
-nur die ersten 3 Aufrufe je Stelle gezeigt). Der Verdacht kommt aus Lauf 1 der letzten
-Runde: der Titel öffnet `ui/vshell/content_ps5/save_icon.png` und arbeitet in
-`cache_ps5` — das riecht nach einem Savedata- oder Profil-Flow, und ein Titel, der seine
-Speicherdaten nicht mounten oder aufzählen kann, dreht sich gern endlos.
-
-**Zu notieren:** jeder Savedata-Aufruf mit Rückgabewert. Wiederholt sich einer endlos?
-Gibt einer einen Fehler zurück, den der Titel offenbar nicht erwartet?
-
-## Lauf 3 — optional, nur zur Einordnung
+Erst wenn `rax` aus Lauf 1 bekannt ist:
 
 ```
-APS5_DUMP_FRAMES=12 APS5_DUMP_FRAMES_EVERY=60 APS5_DUMP_SCALE=4 APS5_DUMP_TARGETS=6 .pp.exe
+APS5_WATCH_ADDR=<rax als Hex, ohne 0x> APS5_HANG_DUMP_SECS=240 .pp.exe
 ```
 
-Beantwortet, **ob hinter dem Kreisel schon eine 3D-Szene gerendert wird** (`APS5_DUMP_FRAMES`
-speichert die präsentierten Frames als BMP, `APS5_DUMP_TARGETS` die ersten Renders jedes
-Color-Targets als Rohdatei). Interessant für das Verständnis, aber **nicht** blockierend:
-selbst wenn die Szene da ist, kommt das Menü erst, wenn der wartende Thread weiterläuft.
-Deshalb zuletzt.
+Der Schalter wartet, bis die Seite committed ist, schützt sie und meldet **jeden
+Schreibzugriff** mit `[watch]`-Zeile. Erwartung und Lesart:
+
+- Es gibt Schreiber, aber der Wert erreicht `r15` nie → wir sehen **wer** zählt und können
+  fragen, warum zu wenig.
+- Es gibt **keinen** Schreiber → der Signalweg fehlt komplett. Dann ist die nächste Frage,
+  welches Subsystem ihn bedienen müsste, und die Adresslage aus Lauf 1 sagt es.
+
+**Zu notieren:** die `[watch]`-Zeilen mit Backtrace, gruppiert nach Schreiber, und wie oft
+pro Sekunde geschrieben wird.
 
 ## Was nicht zu tun ist
 
-- **Nicht** an fps arbeiten. Die Fronten sind dokumentiert und warten; sie bringen das
-  Menü nicht.
-- **Nicht** `APS5_GPU_NO_WRITEBACK` benutzen, um schneller durchzukommen — der Zustand ist
-  kaputt und ein damit erreichtes Menü beweist nichts.
+- **Nicht** an fps arbeiten. Die Engine rendert eine leere Welt; schneller leer bleibt leer.
+- **Nicht** `APS5_GPU_NO_WRITEBACK` benutzen.
 - **Keinen** Code ändern.
-- Den Abbruch aus Lauf 1 nicht als Fehlschlag melden; er ist das Messinstrument.
+- Den Abbruch des Hang-Dumps nicht als Fehlschlag melden; er ist das Messinstrument.
+- Die Frame-Dumps **nicht** wiederholen — schwarz ist beantwortet.
 
 ## Ergebnisform
 
-Aus Lauf 1 die Warteposition**gruppen** mit Thread-Zahl, aus Lauf 2 die Savedata-Aufrufe
-mit Rückgabewerten, Logs nach `_analytics/menu_blocker/`. Ein Satz Urteil: wartet der
-Titel, pollt er, oder kommt er langsam voran?
+Die Registerzeile des Hauptthreads wörtlich, `rax`/`r15`/`r13` benannt, der Vergleich der
+zwei Timeouts, und aus Lauf 2 die Schreiber. Logs nach `_analytics/menu_blocker/`.

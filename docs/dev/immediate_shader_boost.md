@@ -20,18 +20,24 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: der Titel hängt im Ladekreisel, fps warten
+## Vorrang: der Titel kommt nicht aus der Initialisierung, fps warten
 
-> Beobachtet: über **eine Stunde bei ~7 fps lief 95 % der Sitzung der Ladekreisel**, eine
-> Szene war nie zu sehen. Damit ist die fps-Operation **pausiert** — sie bringt das Menü
-> nicht. Was die Logs schon ausschließen: Datei-IO (nur **7** `sceKernelOpen` in 10 s, es
-> wird nichts gestreamt), PlayGo (36 Chunks geladen, alles als installiert gemeldet), die
-> GPU (sie rechnet einen vollen 3D-Frame mit 25 Draws, 12 Compute-Programmen, 4K-Targets
-> mit DCC und Froxel-Culling) und ein sichtbares Scheitern (kein `not implemented`, kein
-> `stub`, keine abgelehnten Draws in irgendeinem Log). Bleibt: ein Thread wartet auf etwas,
-> das nie kommt. Instrument dafür ist `APS5_HANG_DUMP_SECS`, das nach n Sekunden absichtlich
-> abbricht und `ReportAllThreads()` die Backtraces **aller** Threads schreiben lässt.
-> Auftrag: [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+> **Gemessen, nicht vermutet** (Hang-Dumps unter `_analytics/menu_blocker/`): der
+> Hauptthread wartet in keinem OS-Primitiv, sondern dreht in einer rdtsc-getakteten
+> Polling-Schleife auf einen Fortschrittszähler (`[rax+rcx*8]` gegen `r15`,
+> `GhostOfYotei.exe+0xdf3ec2`). **20 JobWorker schlafen** in `sceKernelWaitSema`, **kein**
+> Thread steht in einem HLE-Modul, Savedata ist mit drei `SCE_OK`-Aufrufen in den ersten
+> zwei Sekunden erledigt, und die **präsentierten Frames sind komplett schwarz**. Der
+> Ladekreisel kommt also nicht aus dem Framebuffer des Spiels.
+>
+> Damit ist auch klar, was wir den ganzen Tag optimiert haben: die Engine rendert ihre
+> **leere Welt** — 25 Draws und 12 Compute-Programme über nichts, Ergebnis schwarz. Die
+> fps-Operation unten bleibt gültig und **pausiert**; schneller leer bleibt leer.
+>
+> Nächster Schritt ist klein: `ReportAllThreads` gab nur `rip`/`rsp`/`rbp` aus, die
+> Integer-Register fehlten — und dort stehen die Adresse des Zählers und der Zielwert. Das
+> ist jetzt eingebaut, Auftrag in
+> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
 
 ## Hier morgen weitermachen
 
