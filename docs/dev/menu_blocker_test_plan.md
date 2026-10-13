@@ -1,80 +1,92 @@
-# Messplan: was wird gerendert, und was landet auf dem Schirm
+# Messplan: worauf der Titel im Ladekreisel wartet
 
-Ziel ist nicht mehr fps, sondern das **3D-Hauptmenü**. Zwei Läufe, beide klein, und sie
-beantworten die Vorfrage, ohne die alles andere Raten bleibt: rendert der Titel die Szene
-schon und wir sehen sie nur nicht, oder rendert er sie wirklich nicht?
+Ziel ist das **3D-Hauptmenü**. Beobachtung, die alles umstellt: über eine Stunde bei ~7 fps
+lief **95 % der Sitzung der Ladekreisel**, eine Szene war nie zu sehen. Das ist kein
+fps-Problem. Der Titel **wartet**, und dieser Plan findet heraus, auf was.
 
-## Warum diese Frage zuerst
+## Was die vorhandenen Logs schon ausschließen
 
-Die Telemetrie der letzten Läufe passt **nicht** zu Videowiedergabe. Pro Present, aus
-`_analytics/frame_cost_tests/lauf_1_pipeline_stats.log`:
+Aus `_analytics/frame_cost_tests/lauf_1_pipeline_stats.log`:
 
-- **25 Draws** und **12 Compute-Programme**, darunter ein Froxel-Culling-artiger
-  Voll-4K-Pass über 8,29 Mio. Invocations,
-- **19 Images** pro Dispatch, **4K-Color-Targets mit DCC**, 4K-Texturen im
-  `sampled-lookup`,
-- `fill-clear` löscht **140 MiB pro Present**, `storage-upload`/`-writeback` bewegen
-  721 MiB.
+- **Datei-IO ist es nicht.** In einem 10-s-Fenster gibt es **7** `sceKernelOpen`-Aufrufe,
+  und zwar `/app0/cache_ps5/loc/noloc.larc` (4x), `save_icon.png`, `t26344.dat`,
+  `playgo.pgm`. Ein Titel, der sein Menü lädt, würde hunderte Archive anfassen. Es wird
+  **nichts gestreamt**.
+- **PlayGo ist es nicht.** `[libScePlayGo] Loaded 36 chunks from
+  /app0/sce_sys/playgo-chunk.dat`, und die Implementierung meldet alles als installiert.
+- **Die GPU ist es nicht.** Sie rechnet einen vollen 3D-Frame: 25 Draws, 12
+  Compute-Programme, 19 Images pro Dispatch, 4K-Targets mit DCC, Froxel-Culling,
+  `fill-clear` über 140 MiB pro Present. 8,3 fps sind langsam, aber es läuft.
+- **Es scheitert nichts sichtbar.** Kein `not implemented`, kein `stub`, keine abgelehnten
+  Draws in irgendeinem Log.
 
-Ein Videodecoder braucht davon nichts. Entweder läuft der 3D-Renderer also schon und sein
-Ergebnis erreicht den Bildschirm nicht, oder was wir für „nur Videos" halten, ist eine
-Szene, die bei **8,3 fps** nur sehr langsam vorankommt.
+Bleibt: ein Thread wartet auf etwas, das nie kommt.
 
-## Lauf 1 — was präsentiert wird gegen das, was gerendert wird
-
-```
-APS5_DUMP_FRAMES=20 APS5_DUMP_FRAMES_EVERY=30 APS5_DUMP_SCALE=4 APS5_DUMP_TARGETS=8 APS5_PROFILE_GPU=1 .pp.exe
-```
-
-- `APS5_DUMP_FRAMES=<n>` speichert die ersten n **präsentierten** Frames als
-  `frame_<index>.bmp`; `..._EVERY` nimmt nur jeden n-ten, `APS5_DUMP_SCALE` hält sie klein.
-- `APS5_DUMP_TARGETS=<n>` speichert die ersten n Renders **jedes Color-Targets** als
-  Rohdatei (u32 Breite, u32 Höhe, u32 VkFormat, dann dicht gepackte Zeilen).
-
-**Zu notieren:**
-
-- Zeigen die `frame_*.bmp` Video, Menü, Schwarz oder Standbild?
-- Zeigen die Target-Dumps **andere** Inhalte als die präsentierten Frames? Das ist die
-  Kernfrage. Wenn ja: die 3D-Szene entsteht und wird nicht präsentiert — ein Problem der
-  Präsentation, nicht des Renderers.
-- Wie viele **verschiedene** Color-Targets gibt es, mit welchen Auflösungen und Formaten?
-- Laufen die Dumps lange genug: bitte den Titel **mehrere Minuten** laufen lassen, bevor
-  geurteilt wird. Bei 8,3 fps dauert jeder Ladeschritt ein Vielfaches des Normalen, und
-  „das Menü kommt nicht" kann schlicht „noch nicht" heißen.
-
-## Lauf 2 — nur wenn Lauf 1 zeigt, dass nichts Neues gerendert wird
-
-Dann steckt der Titel fest, und zwar nicht in der Grafik. Ein Lauf ohne Grafikschalter,
-dafür mit den System-Traces, und **drei bis fünf Minuten** laufen lassen:
+## Lauf 1 — der Hang-Dump (das Kernstück)
 
 ```
-APS5_TRACE_EXIT=1 APS5_TRACE_AJM=1 APS5_TRACE_VIDEODEC=1 .pp.exe
+APS5_HANG_DUMP_SECS=240 .pp.exe
 ```
 
-(Alle drei sind im Quellcode geprüft. Ein AvPlayer-Trace existiert **nicht** — nicht
-erfinden; wenn der Verdacht dorthin zeigt, sagen und wir bauen einen.)
+Der Schalter startet einen Watchdog, der nach n Sekunden **absichtlich abbricht** und dabei
+`ReportAllThreads()` ausführt: Backtraces **jedes** Threads. Der Abbruch ist der Zweck des
+Laufs, **kein** Fehler — bitte nicht als Absturz melden.
 
-**Zu notieren:**
+240 s heißt: der Kreisel soll schon eine Weile laufen, wenn es abbricht. Lieber einmal mit
+240 s und einmal mit 600 s, um zu sehen, ob sich die Wartepositionen **verändern** (dann
+läuft etwas, nur unendlich langsam) oder **gleich bleiben** (dann hängt es wirklich).
 
-- Wiederholt sich am Ende dieselbe Zeilenfolge endlos? Dann hängt eine Zustandsmaschine,
-  und die letzte *neue* Zeile davor ist der Ansatzpunkt.
-- Kommen Meldungen über nicht implementierte oder abgelehnte Aufrufe? In den bisherigen
-  Logs steht davon **nichts** — kein `not implemented`, kein `stub`, keine abgelehnten
-  Draws. Das ist selbst ein Befund: es scheitert nichts sichtbar.
-- Dreht die Videowiedergabe in einer Schleife (dasselbe Video mehrfach), oder endet sie?
+**Zu notieren — das ist das Ergebnis des Laufs:**
+
+- Für jeden Thread die obersten Frames, zusammengefasst nach **gleicher Warteposition**:
+  „N Threads in X". Nicht jeden Stack einzeln zitieren.
+- Besonders auf Warteprimitive achten: `sceKernelWaitEqueue`, `pthread_cond_wait`,
+  Semaphore, `sceKernelWaitEventFlag`, `sync_on_address`, Mutexe.
+- Welcher Thread sieht nach dem **Hauptthread** des Spiels aus, und wo steht er?
+- Steht ein Thread in einem unserer HLE-Module (`libSceSaveData`, `libSceNp*`,
+  `libSceSystemService`, `libSceVideoOut`, `libSceAjm`, `libScePlayGo`)? Dann ist das der
+  Kandidat, und der Name der Funktion ist die Antwort.
+- Dreht ein Thread in einer **Schleife** statt zu warten (hoher CPU-Verbrauch, wechselnde
+  Frames über zwei Dumps)? Dann pollt er auf eine Bedingung, die wir falsch melden.
+
+## Lauf 2 — Savedata, falls Lauf 1 dorthin zeigt (oder als Parallelprobe)
+
+```
+APS5_SAVEDATA_TRACE=1 APS5_HANG_DUMP_SECS=240 .pp.exe
+```
+
+`APS5_SAVEDATA_TRACE=1` hebt das Limit der Savedata-Protokollierung auf (ohne ihn werden
+nur die ersten 3 Aufrufe je Stelle gezeigt). Der Verdacht kommt aus Lauf 1 der letzten
+Runde: der Titel öffnet `ui/vshell/content_ps5/save_icon.png` und arbeitet in
+`cache_ps5` — das riecht nach einem Savedata- oder Profil-Flow, und ein Titel, der seine
+Speicherdaten nicht mounten oder aufzählen kann, dreht sich gern endlos.
+
+**Zu notieren:** jeder Savedata-Aufruf mit Rückgabewert. Wiederholt sich einer endlos?
+Gibt einer einen Fehler zurück, den der Titel offenbar nicht erwartet?
+
+## Lauf 3 — optional, nur zur Einordnung
+
+```
+APS5_DUMP_FRAMES=12 APS5_DUMP_FRAMES_EVERY=60 APS5_DUMP_SCALE=4 APS5_DUMP_TARGETS=6 .pp.exe
+```
+
+Beantwortet, **ob hinter dem Kreisel schon eine 3D-Szene gerendert wird** (`APS5_DUMP_FRAMES`
+speichert die präsentierten Frames als BMP, `APS5_DUMP_TARGETS` die ersten Renders jedes
+Color-Targets als Rohdatei). Interessant für das Verständnis, aber **nicht** blockierend:
+selbst wenn die Szene da ist, kommt das Menü erst, wenn der wartende Thread weiterläuft.
+Deshalb zuletzt.
 
 ## Was nicht zu tun ist
 
-- **Nicht** an fps optimieren. Die Fronten (Storage-Round-Trip, Shader-Reste) sind
-  dokumentiert und warten; sie helfen dem Menü nicht, wenn der Titel woanders feststeckt.
+- **Nicht** an fps arbeiten. Die Fronten sind dokumentiert und warten; sie bringen das
+  Menü nicht.
 - **Nicht** `APS5_GPU_NO_WRITEBACK` benutzen, um schneller durchzukommen — der Zustand ist
-  kaputt, und ein damit erreichtes Menü beweist nichts.
+  kaputt und ein damit erreichtes Menü beweist nichts.
 - **Keinen** Code ändern.
-- Die Dumps liegen im Arbeitsverzeichnis des Titels; bitte nach
-  `_analytics/menu_blocker/` verschieben, Logs ebenfalls.
+- Den Abbruch aus Lauf 1 nicht als Fehlschlag melden; er ist das Messinstrument.
 
 ## Ergebnisform
 
-Die Frame-Dumps und ein Satz pro Frage oben. Wenn die Target-Dumps etwas anderes zeigen
-als die präsentierten Frames, bitte **beide** Bilder beilegen — das entscheidet die
-Richtung der nächsten Arbeit vollständig.
+Aus Lauf 1 die Warteposition**gruppen** mit Thread-Zahl, aus Lauf 2 die Savedata-Aufrufe
+mit Rückgabewerten, Logs nach `_analytics/menu_blocker/`. Ein Satz Urteil: wartet der
+Titel, pollt er, oder kommt er langsam voran?

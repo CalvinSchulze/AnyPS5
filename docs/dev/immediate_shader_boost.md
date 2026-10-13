@@ -20,16 +20,18 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: erst das 3D-Hauptmenü, dann fps
+## Vorrang: der Titel hängt im Ladekreisel, fps warten
 
-> Das Ziel ist das **3D-Hauptmenü**, das bisher nie zu sehen war. Dieses Dokument führt die
-> fps-Operation — sie **wartet**, bis geklärt ist, ob der Titel die Szene schon rendert.
-> Die Telemetrie spricht dafür: 25 Draws und 12 Compute-Programme pro Present, 19 Images
-> pro Dispatch, 4K-Targets mit DCC, ein Froxel-Culling-artiger Voll-4K-Pass, `fill-clear`
-> über 140 MiB pro Present. Ein Videodecoder braucht davon nichts. Entweder erreicht das
-> Gerenderte den Schirm nicht, oder die Szene kriecht bei 8,3 fps so langsam, dass es wie
-> Stillstand aussieht. Auftrag dazu:
-> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+> Beobachtet: über **eine Stunde bei ~7 fps lief 95 % der Sitzung der Ladekreisel**, eine
+> Szene war nie zu sehen. Damit ist die fps-Operation **pausiert** — sie bringt das Menü
+> nicht. Was die Logs schon ausschließen: Datei-IO (nur **7** `sceKernelOpen` in 10 s, es
+> wird nichts gestreamt), PlayGo (36 Chunks geladen, alles als installiert gemeldet), die
+> GPU (sie rechnet einen vollen 3D-Frame mit 25 Draws, 12 Compute-Programmen, 4K-Targets
+> mit DCC und Froxel-Culling) und ein sichtbares Scheitern (kein `not implemented`, kein
+> `stub`, keine abgelehnten Draws in irgendeinem Log). Bleibt: ein Thread wartet auf etwas,
+> das nie kommt. Instrument dafür ist `APS5_HANG_DUMP_SECS`, das nach n Sekunden absichtlich
+> abbricht und `ReportAllThreads()` die Backtraces **aller** Threads schreiben lässt.
+> Auftrag: [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
 
 ## Hier morgen weitermachen
 
