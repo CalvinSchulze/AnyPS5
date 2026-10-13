@@ -642,6 +642,41 @@ größer als ein Patch:
    `settle()` (`:3672`, sie zieht `layerGeneration` hinter die eigenen Stempel) das nicht
    schon verhindert — das ist die **nächste Codelesung**, nicht die nächste Messung.
 
+### Wo diese Front steht, wenn sie wieder aufgenommen wird
+
+Der letzte Fund vor dem Schwenk aufs Menü, damit er nicht verloren geht. `Refresh()` nimmt
+sich **selbst** vom Flush aus (`Texture.cpp:1312`):
+
+```cpp
+// This image's own pending results stay on the GPU, where the next dispatch wants them
+refreshing = this;
+```
+
+Der Write-back mit `reason=storage refresh` stammt also **nicht** von dem Image, das
+gerade refreshed wird — sondern von einem **zweiten `StorageTexture`-Objekt über derselben
+Basisadresse**. Der Trace loggt nach `descriptor.baseAddress`, deshalb sah es wie dasselbe
+Image aus. `pendingAlias()` (`:2520` ff.) sucht genau solche Geschwister: gleiche Adresse,
+gleiche Größe, gleiche Form, anderes Format.
+
+Und für diesen Fall **existiert der Ausweg schon**: `borrowUnits` nimmt die Units des
+Alias auf dem Device statt über den Gastspeicher — dann entfällt der Round-Trip. Er greift
+hier nur nicht, weil eine von sechs Bedingungen ihn verweigert (`:1319-1332`):
+
+1. kein Alias mit pending Units,
+2. DCC-Keys nicht `Uncompressed` **oder** kein Host-Import,
+3. `ChangedBlocks` liefert `tracked == false`,
+4. eine pending Unit des Alias ohne Generation (`layerGeneration == 0`),
+5. eine Unit `BlockMaybeWritten`,
+6. eine Unit, die in **beiden** Images pending ist — dann ist die Reihenfolge echt
+   ambivalent und der Store ist die konservative Antwort.
+
+**Nächster Schritt dieser Front ist deshalb klein und risikolos:** eine Trace-Ergänzung
+nach dem Muster von `[staging]` und `drop-unit`, die pro Fläche und Grund **einmal**
+ausgibt, welche der sechs Klauseln den Alias ablehnt. Erst damit weiß man, ob der
+Round-Trip vermeidbar ist (Klauseln 2–5 sind Zustände, die man herstellen kann) oder
+prinzipiell nötig (Klausel 6). Das ist eine Codeänderung ohne Verhaltensrisiko und
+beantwortet die Entwurfsfrage oben.
+
 **Nicht zu verwechseln:** `APS5_GPU_NO_WRITEBACK=1` wirkt, weil es `MarkDirty()` in
 `ShaderResources::MarkGpuWrites` überspringt — ohne Pending-Ergebnisse gibt es keinen
 Flush und damit auch keinen Re-Upload. Das erklärt die +48 %, bricht aber die Korrektheit
