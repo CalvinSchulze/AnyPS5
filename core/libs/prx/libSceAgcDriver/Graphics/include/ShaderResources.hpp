@@ -103,13 +103,17 @@ class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
     ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {});
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots = {});
+    // `dispatchThreads` is the thread count of the dispatch this build serves (its groups times
+    // the workgroup size), 0 for an indirect dispatch or a draw: a written buffer element those
+    // threads sweep is staged in device memory instead of read in place (GuestBufferMemory's
+    // AddWritable `swept`).
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots = {}, std::uint64_t dispatchThreads = 0);
     // Two-stage build for dispatches (see build): with `deferred` the constructor runs stage A only,
     // which needs no device lock, and Complete() runs stage B under GuestMemory::GpuMutex; until
     // then no other member may be used. `compute` and `snapshots` must outlive Complete(). An
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred);
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -475,6 +479,8 @@ private:
     std::uint32_t plannedStorageImages = 0;
     // The compute constructor's shader and captured regions: the caller's objects, valid only until
     // the build (Complete() for a deferred one) is done, and reset then (forgetDeferredInputs).
+    // The dispatch's thread count (see the constructor), kept for the sweep test in addGuestBuffer.
+    std::uint64_t dispatchThreads = 0;
     CompiledShader deferredCompute{};
     std::span<const GuestMemorySnapshot> deferredSnapshots;
     // The deferred build is address-based: everything runs in Complete().

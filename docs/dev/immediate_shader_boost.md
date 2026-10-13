@@ -36,11 +36,14 @@ belegt — aber nur für **~60 %** der Kosten, und der Eingriff selbst ist unbra
 (1,2 fps). Zahlen und Vorbehalte unter
 [Eingriffs-Test](#eingriffs-test-ursache-belegt-fix-noch-nicht).
 
-**Erster Schritt:** die Fix-Richtung ist entschieden und der Riegel benannt. Nicht die
-Device-Adresse fehlt dem Staging — `addressRange` veröffentlicht einen Region-Puffer
-längst —, sondern das `Write`-Permission-Bit, das nur in place gebundene Ranges bekommen.
-Drei kleine Eingriffe, siehe
-[Fix-Richtung](#fix-richtung-der-riegel-ist-das-write-bit-nicht-die-device-adresse).
+**Erster Schritt: gebaut, noch nicht gemessen.** Der Riegel war weder die Device-Adresse
+noch das Write-Bit, sondern `addDescriptorRegion`: für einen adressbasierten Build ist die
+ganze Arena *eine* Basis-Region, jedes V#-Element liegt `Inside`, also entstand gar keine
+Region, die das Staging hätte sehen können. Der **Carve-out** löst genau das, mit A/B über
+`APS5_NO_ADDRESSABLE_STAGING=1` — siehe
+[Carve-out](#gebaut-der-carve-out-riegel-war-die-basis-region-nicht-das-write-bit).
+Nächster Schritt ist der Messlauf, Plan in
+[`carve_out_test_plan.md`](carve_out_test_plan.md).
 
 **Zweite offene Front:** nach dem Eingriff bleiben 27,6 ms pro Dispatch = 3,33 ms pro
 Mio. Invocations, immer noch 50–250x über den billigen 4K-Pässen. Da sitzt eine
@@ -366,44 +369,73 @@ Taktzustände, Cache-Residenz und fehlende Parallelarbeit unterscheiden sich dam
 der Basislinie; die Richtung und die Selektivität der Signatur sind überzeugend, die
 genauen Faktoren 2,4x und 6,4x sind weich.
 
-### Fix-Richtung: der Riegel ist das Write-Bit, nicht die Device-Adresse
+### Gebaut: der Carve-out (Riegel war die Basis-Region, nicht das Write-Bit)
 
 Gebraucht wird device-lokale Ablage **nur für die Ranges, die der heiße Shader wirklich
 anfasst** — nicht für die ganze Arena. Genau das tut das Written-Shadow-Staging, und es
-ist für adressierbare Builds gesperrt, laut Kommentar in `:2148` weil
-„AddressRanges needs a device address".
+war für adressierbare Builds gesperrt.
 
-**Der Kommentar trägt nicht mehr.** Im Code gelesen (`GuestBufferMemory.cpp:2880`):
+Zwei Verdächtige fielen beim Lesen des Codes weg, bevor der echte Riegel auftauchte:
+
+- **Die Device-Adresse ist es nicht.** `addressRange` (`:2880`) veröffentlicht längst
+  `region.buffer->DeviceAddress()`, und `gpuCopyUsage(addressable)` hängt dem
+  Staging-Puffer `SHADER_DEVICE_ADDRESS_BIT` an. Der Kommentar „AddressRanges needs a
+  device address" trug nicht mehr.
+- **Das Write-Bit ist es auch nicht.** `addressRange` setzt `Write` nur für
+  `region.direct != nullptr`, aber die Aufteilung am Ende von `AddressRanges()` (`:2911`)
+  schneidet jede Range ohne `Write` an den `writes`-Intervallen und vergibt das Bit dort
+  mit der *gestagten* Adresse. Eine gestagte, geschriebene Region bekommt es also
+  ohnehin.
+
+**Der Riegel war `addDescriptorRegion`:**
 
 ```cpp
-const auto address = region.direct != nullptr ? ... : region.mirror != nullptr ? ... : region.buffer->DeviceAddress();
-const auto permissions = Read | (region.direct != nullptr && region.writable ? Write : 0u);
+switch (baseOverlap(begin, end, nullptr)) {
+    case BaseOverlap::Inside:
+        return;              // die Basis-Region bedient die Range
 ```
 
-`addressRange` **veröffentlicht schon heute** die Device-Adresse eines eigenen
-Region-Puffers, und `gpuCopyUsage(addressable)` (`:2157`) hängt dem Staging-Puffer
-`SHADER_DEVICE_ADDRESS_BIT` an, wenn der Build adressierbar ist. `AddressRanges()`
-(`:2888`) nimmt *alle* `regions` auf, nicht nur die in place gebundenen. Eine gestagte
-Region ist also publizierbar — die Adresse ist nicht das Problem.
+Für einen adressbasierten Build ist die ganze 3416-MiB-Arena **eine Basis-Region** des
+Address Space. Jedes der zwölf V#-Elemente liegt darin, also `Inside`, also wird
+**überhaupt keine Region angelegt** — `stagingEligible` sieht diese Buffer nie, egal was
+in ihm steht. Das erklärt die acht kleinen Regionen aus dem R5-Trace restlos: das waren
+genau die, die *außerhalb* einer Basis-Region lagen.
 
-Das Problem ist das **Permission-Bit**: `Write` wird nur für `region.direct != nullptr`
-gesetzt, also nur für in place im Import gebundene Ranges. Eine gestagte Region käme als
-**read-only** in die Tabelle, und jeder BDA-Store dagegen würde in
-`get_bda_write_pointer` an `FaultReason::Permission` scheitern.
+**Was gebaut ist** (Build grün, Laufzeit noch nicht gemessen):
 
-Der Eingriff ist damit klein und benannt:
+1. `addDescriptorRegion` legt für ein **gefegtes** geschriebenes Element doch eine Region
+   an und markiert sie `carvedOut`, statt sie der Basis-Region zu überlassen.
+2. `stagingEligible` lässt bei adressierbaren Builds genau diese Carve-outs durch
+   (`addressable && !region.carvedOut` sperrt weiter alles andere) und gibt gefegten
+   Regionen das größere Fenster (16 MiB, `APS5_SWEPT_SHADOW_MAX_KIB`).
+3. `AddressRanges()` **subtrahiert** die Carve-out-Spannen aus den Basis-Ranges. Das ist
+   nicht Kosmetik: der emittierte Lookup ist eine Binärsuche, die aufsteigende,
+   überlappungsfreie Einträge braucht. Zwei Einträge über dasselbe Gast-Byte würden nach
+   Position statt nach Absicht gewählt. `requireTableOrder` prüft die Invariante jetzt
+   pro Tabelle, statt sie zu unterstellen.
+4. Die Sweep-Erkennung: `Dispatch.cpp` rechnet die Thread-Zahl (Gruppen x Workgroup) aus,
+   `PrepareDispatch` und der `ShaderResources`-Konstruktor tragen sie, und
+   `addGuestBuffer` nennt ein Element gefegt, wenn `threads * stride * 2 >= bytes`.
+   Indirekte Dispatches (Gruppen erst auf der GPU) und Raw-Buffer (Stride 0) sind nie
+   gefegt.
 
-1. `stagingEligible` (`:2295`) das `addressable` aus dem Early-Return nehmen — gezielt,
-   nicht pauschal (siehe Sweep-Heuristik unten).
-2. In `addressRange` das `Write`-Bit auch für eine gestagte Region setzen (`gpuCopy` und
-   `deviceLocal`), deren Bytes `RecordCopyBacks` zurückschreibt.
-3. Das Fenster auf die wirklich gefegten Ranges begrenzen, statt `MAX_KIB` hochzudrehen.
+Für den Flaschenhals passt das Kriterium ohne Spielraum: Buffer 4 hat 2 B Stride und
+8.294.400 Records bei 8.294.400 Threads, Buffer 10 hat 1 B Stride und 8.165.312 Records
+— beide zu 100 % gefegt, beide innerhalb 16 MiB. Buffer 7 und 9 (4 B, 4,1 MB) ebenfalls.
 
-Zu klären, bevor etwas gebaut wird: ob Gast-Zeiger-Arithmetik im Shader über
-Range-Grenzen hinweg rechnet (dann bricht ein Remap — der Lookup in `SpirvBdaLookup.cpp`
-sucht pro Zugriff die *eine* Range, die alle Bytes hält, ein Zugriff über die Grenze
-faultet also ohnehin schon), und wie die Rück-Kopie mit den `direct`-Schreibmarken und
-der Pending-Write-Notiz zusammenspielt.
+**A/B in einem Build:** `APS5_NO_ADDRESSABLE_STAGING=1` schaltet den Carve-out ab und
+stellt das alte Verhalten her. Das ist der Vergleich, der die Hypothese prüft.
+
+**Offen und zu messen, nicht zu glauben:**
+
+- Ob die zwei Bulk-Kopien pro Dispatch (Copy-in und Copy-back, ~33 MB) billiger sind als
+  die PCIe-Zugriffe, die sie ersetzen. Der `NO_HOST_IMPORT`-Lauf sagt, dass die Zugriffe
+  ~39 ms wert sind; die Kopien sollten device-lokal bei wenigen ms liegen.
+- Die **CPU-Seite**: mit Carve-outs ist `regions` nicht mehr leer, also greift
+  `CachedAddressTable` nicht und jeder adressbasierte Build baut die Tabelle neu
+  (856 Ranges plus Subtraktion). Sichtbar in `[address] us per build` und `[bda-table]`.
+  Das ist genau der Weg, auf dem `NO_HOST_IMPORT` gescheitert ist — nur viel kleiner.
+- Ob `requireTableOrder` anspringt. Es darf nicht, aber wenn doch, ist das ein Fund.
 
 ## Verdacht auf die zweite Kostenquelle: der Lookup pro Zugriff
 

@@ -994,7 +994,7 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
 
-ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
+ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads) : ShaderResources(context, compute, snapshots, false, dispatchThreads) {}
 
 namespace {
 
@@ -1006,7 +1006,7 @@ bool UsesAddressTables(const CompiledShader& compute) {
 
 }
 
-ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred) : context(context), guestMemory(context), deferredCompute(compute), deferredSnapshots(snapshots) {
+ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads) : context(context), guestMemory(context), dispatchThreads(dispatchThreads), deferredCompute(compute), deferredSnapshots(snapshots) {
     Require(compute.stage == ShaderRecompiler::ShaderStage::Compute, "compute resources require a compute shader");
     // Every use of a compute build is a recorded dispatch that calls MarkGpuWrites, which staged
     // buffers need (a synchronous draw's use would not).
@@ -2612,7 +2612,14 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
     Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
     written = written || allWritten;
-    if (written) guestMemory.AddWritable(address, size, atomic);
+    // A written element this dispatch's threads sweep: one record per thread at the V# stride
+    // reaches at least half of it, so the two bulk copies of a device-local shadow replace one
+    // scattered access per record, which inside a host import is a PCIe round trip (see
+    // GuestBufferMemory::AddWritable). A raw buffer (stride 0) and an indirect dispatch (no thread
+    // count before the GPU reads its arguments) are not swept.
+    const std::uint64_t stride = descriptor.Stride();
+    const bool swept = written && stride != 0 && dispatchThreads != 0 && dispatchThreads * stride * 2u >= byteSize;
+    if (written) guestMemory.AddWritable(address, size, atomic, swept);
     else {
         guestMemory.AddReadable(address, size);
         ++readOnlyBuffers;
