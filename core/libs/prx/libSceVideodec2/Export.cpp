@@ -164,6 +164,8 @@ bool Trace() {
 // before the first picture, not a failure.
 std::atomic<std::uint64_t> g_decodeCalls{0};
 std::atomic<std::uint64_t> g_decodePictures{0};
+std::atomic<std::uint64_t> g_decodeFlushes{0};
+std::atomic<std::uint64_t> g_decodeDeletes{0};
 std::atomic<std::int64_t> g_decodeReported{0};
 
 void NoteDecodeProgress(std::uint32_t width, std::uint32_t height) {
@@ -171,7 +173,7 @@ void NoteDecodeProgress(std::uint32_t width, std::uint32_t height) {
     auto reported = g_decodeReported.load(std::memory_order_relaxed);
     if (reported != 0 && now - reported < 5000) return;
     if (!g_decodeReported.compare_exchange_strong(reported, now)) return;
-    std::fprintf(stderr, "[videodec2] %llu decode calls, %llu pictures out, last %ux%u\n", static_cast<unsigned long long>(g_decodeCalls.load()), static_cast<unsigned long long>(g_decodePictures.load()), width, height);
+    std::fprintf(stderr, "[videodec2] %llu decode calls, %llu pictures out, %llu flushes, %llu deletes, last %ux%u\n", static_cast<unsigned long long>(g_decodeCalls.load()), static_cast<unsigned long long>(g_decodePictures.load()), static_cast<unsigned long long>(g_decodeFlushes.load()), static_cast<unsigned long long>(g_decodeDeletes.load()), width, height);
 }
 
 std::uint32_t AlignUp(std::uint32_t value, std::uint32_t alignment) {
@@ -377,6 +379,7 @@ int APS5_VABI sceVideodec2CreateDecoder_nid_postfix(const DecoderConfigInfo* con
 int APS5_VABI sceVideodec2DeleteDecoder_nid_postfix(std::uint64_t handle) {
     std::lock_guard guard(lock);
     if (decoders.erase(handle) == 0) throw std::runtime_error("Videodec2: invalid decoder handle");
+    if (Trace()) g_decodeDeletes.fetch_add(1, std::memory_order_relaxed);
     return 0;
 }
 
@@ -417,6 +420,7 @@ int APS5_VABI sceVideodec2Flush_nid_postfix(std::uint64_t handle, FrameBuffer* f
     if (!found) throw std::runtime_error("Videodec2: invalid decoder handle");
     auto& decoder = *found;
     std::lock_guard guard(decoder.mutex);
+    if (Trace()) g_decodeFlushes.fetch_add(1, std::memory_order_relaxed);
     if (!decoder.flushing) {
         Send(decoder, nullptr);
         decoder.flushing = true;

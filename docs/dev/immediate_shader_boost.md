@@ -20,26 +20,30 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: der Titel füttert einen H.264-Decoder, und sonst steht alles
+## Vorrang: der Intro-Film läuft durch, danach hört alles auf
 
-> **Ausgeschlossen, mit Zahlen:** Deadlock (`r15` steigt mit der Bildrate), GPU-Fences (alle
-> Slots, auf die gewartet wird, laufen mit — Stride-32 und Stride-8-Dump stimmen überein),
-> HLE-Threads (kein Thread in einem unserer Module), Savedata (3 Aufrufe, alle `SCE_OK`),
-> PlayGo (36 Chunks, alles installiert), Registerdruck, SPIR-V-Optimierung, Codemenge.
+> **Der Moment ist lokalisiert.** Der korrigierte Lesezähler zeigt, dass der Titel liest
+> (AIO lief am alten Zähler vorbei): 1064 Leseaufrufe, 8,9 MiB. Und der **Decoder arbeitet**
+> — 150 von 152 Aufrufen geben ein Bild bei **1920x1080** zurück. Beide Reihen enden
+> **gleichzeitig** (Logzeile 4619 und 4625), danach ~3075 Zeilen ohne einen einzigen Lese-
+> oder Dekodiervorgang, während die GPU weiterläuft (`[gpu] 3000 → 3700 dispatches`).
 >
-> **Gemessen, aber nicht beweiskräftig:** „101 Leseaufrufe, 6,0 MiB, danach nichts" über
-> 245 s. Der Zähler saß in `sceKernelPread`, und `Aio.cpp` ruft
-> `NativePositioned_nid_no_patch` **direkt** — AIO lief daran vorbei. Jetzt sitzt er am
-> Engpass; ob der Titel lädt, ist bis dahin **offen**.
+> 150 Bilder sind bei 30 fps ein **5-Sekunden-Clip** — der Intro-Film läuft also
+> wahrscheinlich bis zum Ende, und *danach* beginnt nichts Neues mehr.
 >
-> **Die neue Spur:** der Titel erzeugt einen **H.264-Decoder für 1920x1088** und schickt
-> echte Access Units hinein (249250, 13157, 17651 Byte). Ob Bilder herauskommen, war nicht
-> messbar — die `Decode`-Zeile ist auf drei Aufrufe begrenzt und liest Breite und Höhe
-> **vor** dem Dekodieren, weshalb `size=0x0` dort nichts bedeutet. Eine Fortschrittszeile
-> zählt jetzt Aufrufe gegen zurückgegebene Bilder.
+> **Aus dem Code ausgeschlossen, nicht geraten:** AIO hängt nicht (`Aio.cpp` führt jede
+> Anfrage synchron aus und setzt `AioCompleted`), Flip- und Vblank-Events werden geliefert
+> (`triggerEvents` pro Vblank), der Decoder liefert Bilder. Dazu alles aus den Runden davor:
+> Deadlock, Fences, HLE-Threads, Savedata, PlayGo, Registerdruck, Codemenge.
 >
-> **Weiter offen:** 30 präsentierte Frames, alle schwarz. `APS5_DUMP_TARGETS=12` erzeugte
-> **0** Dateien, Grund unbekannt — die Render-Targets hat damit immer noch niemand gesehen.
+> **Gefunden, aber noch nicht als Ursache belegt:** `sceSystemServiceReceiveEvent` gibt
+> **unbedingt `NO_EVENT`** zurück (`libSceSystemService/Export.cpp:107`). Ein Titel, der auf
+> ein Systemereignis wartet, wartet damit für immer. Ob dieser Titel die Pumpe überhaupt
+> benutzt, zählt jetzt `APS5_TRACE_SYSTEMEVENT`; dazu zählt die `[videodec2]`-Zeile die
+> `Flush`- und `Delete`-Aufrufe, also ob der Film ordentlich abgebaut wird.
+>
+> **Weiter offen:** 30 präsentierte Frames schwarz, und `APS5_DUMP_TARGETS` erzeugt 0
+> Dateien auch im richtigen Verzeichnis — die Render-Targets hat niemand gesehen.
 >
 > Auftrag: [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md). Die fps-Operation unten
 > bleibt pausiert, Prognose in [`frame_budget_roadmap.md`](frame_budget_roadmap.md).

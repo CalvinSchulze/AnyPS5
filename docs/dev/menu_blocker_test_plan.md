@@ -1,4 +1,4 @@
-# Messplan: liest er wirklich nichts, und kommen Bilder aus dem Decoder?
+# Messplan: was der Titel nach dem Intro-Film noch tut
 
 ## Regel für diesen Auftrag: **nicht interpretieren**
 
@@ -7,99 +7,95 @@ Zahlen mit ihrer Quelle, nichts weiter. Kein Urteil, keine Ursache, keine Hypoth
 zitieren mit Zeilennummer, zählen, tabellieren. Eine Beobachtung, die nicht zur Frage passt,
 **unkommentiert nennen**. Fehlt ein Schalter oder scheitert ein Lauf: sagen, nicht ersetzen.
 
-Die letzten zwei Runden waren genau so, und beide waren dadurch brauchbar.
+## Was die letzte Runde ergeben hat
 
-## Warum diese Runde nötig ist: zwei Instrumente waren untauglich
+Der korrigierte Lesezähler zeigt: **der Titel liest** (AIO lief am alten Zähler vorbei).
 
-**1. Mein Lesezähler war blind.** Er saß in `sceKernelPread`, aber `Aio.cpp` ruft
-`NativePositioned_nid_no_patch` **direkt** — die Lesevorgänge des AIO-Workers liefen also
-daran vorbei. „101 Leseaufrufe, 6,0 MiB, danach nichts" war damit **kein** Beweis, dass der
-Titel nichts lädt. Der Zähler sitzt jetzt am Engpass, durch den `pread` **und** AIO laufen.
+```
+4054: 101 read calls, 6.0 MiB      4065: 1 decode calls, 0 pictures out, last 0x0
+4437: 361 read calls, 6.8 MiB      4447: 42 decode calls, 40 pictures out, last 1920x1080
+4518: 594 read calls, 7.5 MiB      4524: 80 decode calls, 78 pictures out
+4539: 829 read calls, 8.2 MiB      4556: 116 decode calls, 114 pictures out
+4619: 1064 read calls, 8.9 MiB     4625: 152 decode calls, 150 pictures out, last 1920x1080
+```
 
-**2. `size=0x0` in den `[videodec2] Decode`-Zeilen bedeutet nichts.** Die Zeile liest
-`decoder.width/height` **vor** dem Dekodieren, und sie ist auf die ersten drei Aufrufe
-begrenzt — 0x0 ist also der Zustand vor dem ersten Bild, kein Fehler. Neu ist deshalb eine
-Fortschrittszeile, die zählt, wie viele Dekodier-Aufrufe kamen und wie viele davon ein Bild
-**zurückgegeben** haben.
+**Der Decoder arbeitet** — 150 von 152 Aufrufen geben ein Bild bei 1920x1080 zurück. Und
+**beide Reihen enden gleichzeitig** (Zeile 4619 und 4625); danach kommen ~3075 Logzeilen
+ohne einen einzigen Lese- oder Dekodiervorgang, während die GPU weiterläuft
+(`[gpu] 3000 → 3700 dispatches`).
 
-Was aus der letzten Runde stehen bleibt: der Decoder wird für **H.264 1920x1088** erzeugt,
-und der Titel schickt echte Access Units hinein (249250, 13157, 17651 Byte). Gefüttert wird
-er also.
+Aus dem Code dazu ausgeschlossen: **AIO hängt nicht** (`Aio.cpp` führt jede Anfrage
+synchron aus und setzt `AioCompleted`), und **Flip/Vblank-Events werden geliefert**
+(`triggerEvents` pro Vblank). Weiterhin offen: `APS5_DUMP_TARGETS` erzeugt **0** Dateien,
+auch im richtigen Verzeichnis.
+
+**Die Frage dieser Runde:** 150 Bilder sind bei 30 fps ein 5-Sekunden-Clip. Baut der Titel
+den Film danach ordentlich ab, und was pollt er, während er wartet?
 
 ## Bauen und Deployen: ja, nötig — **zwei** Module
 
 ```
-ninja -C "I:\Emulation\PS5 Emu\Software\AnyPS5\build" core/libs/libs/libkernel.prx core/libs/libs/libSceVideodec2.prx
+ninja -C "I:\Emulation\PS5 Emu\Software\AnyPS5\build" core/libs/libs/libSceVideodec2.prx core/libs/libs/libSceSystemService.prx
 ```
 
-Toolchain-`bin` in den `PATH` (Ninja und g++ im Scratchpad einer früheren Sitzung, `cmake`
-ist **nicht** im `PATH`):
+Toolchain-`bin` in den `PATH`:
 
 ```
 C:\Users\CptWhuti\AppData\Local\Temp\claude\I--Emulation-PS5-Emu-Software-AnyPS5\685ea80c-0bfb-4ab4-b237-3f3880416715\scratchpad\mingw64\bin
 ```
 
-**Deployen** wie gehabt, jetzt **beide** Dateien, je dreifach:
+**Deployen**, beide Dateien je dreifach:
 
 ```
-build\core\libs\libs\libkernel.prx        ->  Z:\GhostOfYotei\libkernel.prx
-                                              Z:\GhostOfYotei\libs\libkernel.prx
-                                              Z:\GhostOfYotei\libs\libs\libkernel.prx
-build\core\libs\libs\libSceVideodec2.prx  ->  Z:\GhostOfYotei\libSceVideodec2.prx
-                                              Z:\GhostOfYotei\libs\libSceVideodec2.prx
-                                              Z:\GhostOfYotei\libs\libs\libSceVideodec2.prx
+build\core\libs\libs\libSceVideodec2.prx     ->  Z:\GhostOfYotei\libSceVideodec2.prx
+                                                 Z:\GhostOfYotei\libs\libSceVideodec2.prx
+                                                 Z:\GhostOfYotei\libs\libs\libSceVideodec2.prx
+build\core\libs\libs\libSceSystemService.prx ->  Z:\GhostOfYotei\libSceSystemService.prx
+                                                 Z:\GhostOfYotei\libs\libSceSystemService.prx
+                                                 Z:\GhostOfYotei\libs\libs\libSceSystemService.prx
 ```
 
 **Marker, dass es greift:**
 
-> `[fileio] tracing enabled` muss im Log stehen **und** mindestens eine Zeile der Form
-> `[videodec2] N decode calls, M pictures out, last WxH`. Fehlt eines von beiden:
-> **abbrechen und melden**, mit der Angabe, welches fehlt.
+> Mindestens eine Zeile `[videodec2] ... flushes, ... deletes, last ...` **und** mindestens
+> eine Zeile `[sysevent] ... receive calls`. Fehlt eines von beiden: **abbrechen und melden**,
+> mit Angabe welches.
 
-## Lauf 1 — Lesen und Dekodieren zusammen
+## Lauf 1 — Film-Abbau und Event-Pumpe
 
 ```
-APS5_TRACE_FILEIO=1 APS5_TRACE_VIDEODEC=1 .pp.exe
+APS5_TRACE_VIDEODEC=1 APS5_TRACE_SYSTEMEVENT=1 .pp.exe
 ```
 
 **Vier Minuten.** Beide Zeilenarten kommen höchstens alle fünf Sekunden.
 
-**Zu berichten:**
-
-1. **Alle** `[fileio]`-Zeilen wörtlich mit Zeilennummer, in Reihenfolge.
-2. **Alle** `[videodec2] ... decode calls ...`-Zeilen wörtlich mit Zeilennummer, in
-   Reihenfolge. (Die `Decode`-Zeilen mit `input=`/`au=` sind diesmal **nicht** gefragt.)
-3. Die Zeilennummer der **letzten** Zeile jeder der beiden Arten, und wie viele Logzeilen
-   danach noch kommen.
-4. Alle `sceKernelOpen`-Pfade in Reihenfolge.
-
-## Lauf 2 — die Render-Targets, zweiter Versuch
-
-Im letzten Lauf entstanden **0** `target_*.raw`-Dateien, obwohl `APS5_DUMP_TARGETS=12`
-gesetzt war. Die Dateien heißen `target_<adresse>_<n>.raw` und werden ins
-**Arbeitsverzeichnis des Titels** geschrieben, dort, wo auch die `frame_*.bmp` landen.
-
-```
-APS5_DUMP_TARGETS=12 APS5_DUMP_FRAMES=4 APS5_DUMP_SCALE=4 .pp.exe
-```
-
-Zwei Minuten.
+Die `[videodec2]`-Fortschrittszeile trägt jetzt zusätzlich `flushes` und `deletes` (Aufrufe
+von `sceVideodec2Flush` und `sceVideodec2DeleteDecoder`). `[sysevent]` zählt die Aufrufe von
+`sceSystemServiceReceiveEvent`, das im Code **unbedingt `NO_EVENT`** zurückgibt.
 
 **Zu berichten:**
 
-1. Eine **Verzeichnisauflistung** des Ordners, in dem die `frame_*.bmp` liegen — alle
-   Dateinamen, die beim Lauf neu entstanden sind.
-2. Falls `target_*`-Dateien dabei sind: pro Datei Breite x Höhe, `VkFormat` und Max je Kanal.
-3. Falls keine dabei sind: genau das schreiben, zusammen mit der Auflistung aus Punkt 1.
+1. **Alle** `[videodec2] ... decode calls ...`-Zeilen wörtlich mit Zeilennummer.
+2. **Alle** `[sysevent]`-Zeilen wörtlich mit Zeilennummer.
+3. Für jede der beiden Arten: die Zeilennummer der **letzten** Zeile und wie viele Logzeilen
+   danach noch folgen.
+4. Laufen die `[sysevent]`-Zahlen nach dem Ende der `[videodec2]`-Zeilen **weiter**? Nur die
+   Zahlen, keine Deutung.
+
+## Lauf 2 — nur falls Lauf 1 ohne `[sysevent]`-Zeilen bleibt
+
+Dann pollt der Titel die Event-Pumpe nicht, und die Frage verschiebt sich. In diesem Fall
+**keinen** weiteren Lauf starten, sondern melden — der nächste Schritt ist dann eine
+Codeänderung, keine Messung.
 
 ## Was nicht zu tun ist
 
 - **Nicht** interpretieren.
-- **Nicht** erneut Hang-Dumps, Sampler, `WATCH_ADDR`, `DUMP_GUEST` oder einen reinen
-  Frame-Dump fahren — alle fünf sind durch (30 Frames, alle schwarz).
+- **Nicht** erneut Hang-Dumps, Sampler, `WATCH_ADDR`, `DUMP_GUEST`, Frame-Dumps oder
+  `TRACE_FILEIO` fahren — alle sind durch.
 - **Nicht** an fps arbeiten.
 - **Keinen** Code ändern.
 
 ## Ergebnisform
 
-Die zitierten Zeilen, die Verzeichnisauflistung, Logs nach `_analytics/menu_blocker/`.
+Die zitierten Zeilen, Logs nach `_analytics/menu_blocker/`.

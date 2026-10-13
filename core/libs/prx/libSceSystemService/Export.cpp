@@ -2,11 +2,36 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <atomic>
+#include <chrono>
 #include "prx/libc/include/Shutdown.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+
+namespace {
+
+// APS5_TRACE_SYSTEMEVENT=1 counts how often the title pumps the system event queue and prints a
+// line every five seconds. sceSystemServiceReceiveEvent below answers NO_EVENT unconditionally,
+// so a title that waits for a particular event waits forever - and the polling rate is the only
+// way to tell "pumps it once a frame like everyone" from "spins on it".
+std::atomic<std::uint64_t> g_receiveCalls{0};
+std::atomic<std::int64_t> g_receiveReported{0};
+
+void NoteReceiveEvent() {
+    static const bool trace = std::getenv("APS5_TRACE_SYSTEMEVENT") != nullptr;
+    if (!trace) return;
+    const auto calls = g_receiveCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto reported = g_receiveReported.load(std::memory_order_relaxed);
+    if (reported != 0 && now - reported < 5000) return;
+    if (!g_receiveReported.compare_exchange_strong(reported, now)) return;
+    std::fprintf(stderr, "[sysevent] %llu receive calls, all answered NO_EVENT\n", static_cast<unsigned long long>(calls));
+}
+
+}
 
 extern "C" {
 
@@ -104,6 +129,7 @@ int APS5_VABI sceSystemServiceReceiveEvent(SystemServiceEvent* event) {
  if (event == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
+ NoteReceiveEvent();
  return SYSTEM_SERVICE_ERROR_NO_EVENT;
 }
 
