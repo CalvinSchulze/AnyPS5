@@ -108,24 +108,32 @@ Disassembly eine andere Bedeutung haben, zeigt dieser Lauf die Werte dicht an di
 
 **Zu berichten:** erste und letzte Zeile wörtlich, dazu dieselbe Tabelle wie oben.
 
-## Lauf 3 — Bild gegen Ton (neu, und vorrangig)
+## Lauf 3 — rendert er nichts, oder verliert er das Bild? (vorrangig)
 
-**Neue Beobachtung von außen:** während der Läufe ist der **Ton der Start-Animationen
-hörbar**. Der Titel produziert also Inhalt, während die präsentierten Frames komplett
-schwarz waren. Damit ist Schwarz nicht mehr erwartbar, sondern verdächtig, und der
-Frame-Dump ist **doch** zu wiederholen — diesmal dichter und zusammen mit den
-Render-Targets.
+**Was wir über die Phasen wissen** (Beobachtung von außen, präzisiert): der Titel spielt am
+Anfang **Animationen mit Bild und Ton** — die waren schon sichtbar, der Ton ist es jetzt
+auch. Danach soll die 3D-Szene laden, und **dort** bleibt es: Ladekreisel, schwarze Frames,
+kein Ton mehr. Die Intro-Phase funktioniert also, der Übergang danach nicht.
+
+Der Ton beweist damit **nicht**, dass im hängenden Zustand Inhalt entsteht — er gehört zur
+Phase davor.
+
+**Die offene Frage bleibt deshalb:** rendert der Titel im hängenden Zustand wirklich nichts,
+oder entsteht ein Bild, das auf dem Weg zum Bildschirm verloren geht? Die präsentierten
+Frames waren schwarz; was in den Render-Targets steht, hat niemand angesehen.
 
 ```
 APS5_DUMP_FRAMES=30 APS5_DUMP_FRAMES_EVERY=10 APS5_DUMP_SCALE=4 APS5_DUMP_TARGETS=12 APS5_TRACE_VIDEODEC=1 .pp.exe
 ```
 
-Mindestens **drei Minuten**, damit die Animationen durchlaufen.
+Mindestens **drei Minuten**, damit die Intro-Phase durch ist und der hängende Zustand
+mehrere Minuten mitläuft.
 
 **Zu berichten:**
 
-1. Pro `frame_*.bmp`: **Max-Wert je Kanal** (R, G, B) und ob er von 0 verschieden ist.
-   Eine Zeile pro Datei, keine Deutung.
+1. Pro `frame_*.bmp`: **Max-Wert je Kanal** (R, G, B), eine Zeile pro Datei, in der
+   Reihenfolge der Dateinummern. Keine Deutung — die Reihenfolge zeigt von selbst, ob der
+   Anfang anders aussieht als das Ende.
 2. Dasselbe für die Target-Dumps: Datei, Breite x Höhe, `VkFormat`, Max je Kanal.
 3. **Alle** `[videodec2]`-Zeilen wörtlich. Falls keine erscheint: genau das schreiben.
 4. Die Zahl der `[videoout]`- und `flip`-Zeilen, falls vorhanden.
@@ -133,7 +141,7 @@ Mindestens **drei Minuten**, damit die Animationen durchlaufen.
 **Eine Falle vorweg, damit sie nicht als Befund auftaucht:** die `[videodec2] Decode`-Zeile
 ist im Code auf die **ersten drei** Dekodierungen begrenzt (`decoder.decoded < 3`). Drei
 Zeilen heißen also **nicht**, dass nur drei Frames dekodiert wurden. Die
-`Query...`/`Allocate...`-Zeilen kommen dagegen pro Aufruf.
+`Query...`/`Allocate...`-Zeilen kommen pro Aufruf.
 
 ## Was nicht zu tun ist
 
