@@ -1,5 +1,12 @@
 # Messplan: wer die Storage-Images schmutzig macht
 
+> **Gelaufen am 13.10., abgeschlossen.** Logs unter `_analytics/pingpong_tests/`,
+> Ergebnisse im Hauptdokument. Lauf 1: Hypothese **bestätigt**, `cpuWrote` zu 100 % 0 für
+> alle drei Haupt-Targets, Ursache auf `Texture.cpp:1424` / `:1739` / `:2806` festgenagelt.
+> Lauf 2: Hypothese **gefallen** — `laneCount=1` verdoppelt die Laufzeit, symmetrisch für
+> beide Shader; zwei Lanes sind das Optimum. Nächster Schritt ist eine Codeänderung, kein
+> Messlauf.
+
 Zwei Läufe, beide klein. Vorgeschichte in
 [`immediate_shader_boost.md`](immediate_shader_boost.md); die Runde davor steht in
 [`frame_cost_test_plan.md`](frame_cost_test_plan.md) und ist abgeschlossen.

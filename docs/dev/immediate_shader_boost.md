@@ -44,24 +44,26 @@ von 66,8 auf **27,6 ms** pro Dispatch und die Szene von 6,4 auf **8,3 fps**, bei
 Kopien pro Present und ruhiger CPU-Seite — siehe
 [Carve-out](#der-carve-out-trägt-gemessen-24x-und-30--fps).
 
-**Hier weitermachen.** Neun Läufe sind durch (A–D in `_analytics/carve_out_tests/`,
-1–5 in `_analytics/frame_cost_tests/`). Stand des Frames nach dem Carve-out: 100 ms, davon
-27,6 ms Flaschenhals, 19,8 ms zweiter Shader, 18,4 ms `draw`, 24 ms Storage-Image-Traffic.
+**Hier weitermachen.** Elf Läufe sind durch (A–D in `_analytics/carve_out_tests/`, 1–5 in
+`_analytics/frame_cost_tests/`, 2 in `_analytics/pingpong_tests/`). Der Frame steht bei
+100 ms: 27,6 ms Flaschenhals, 19,8 ms zweiter Shader, 18,4 ms `draw`, 24 ms
+Storage-Image-Traffic.
 
-1. **Größter Hebel: der Storage-Image-Pingpong.** `APS5_GPU_NO_WRITEBACK=1` bringt
-   **+48 % fps** (8,2 → 12,1) und drittelt dabei die Draws. Kein Fix, aber eine Obergrenze,
-   und sie ist riesig. Die Diagnose fehlt noch an *einer* Stelle: `APS5_CAPTURE_TRACE=1`
-   zeigt das Feld `cpuWrote` und entscheidet, ob der Treiber seine eigenen Write-backs für
-   Gast-Änderungen hält. Siehe [Pingpong](#die-größte-front-der-storage-image-pingpong).
-2. **Der Rest des Flaschenhalses ist ausgeführte Befehlsmenge**, nicht Speicher, nicht
-   Registerdruck (kein Spilling), nicht fehlende Optimierung (`SPIRV_OPT=full` bringt
-   1,4 %). Nächster Schritt ist klein: `APS5_SINGLE_LANE=800038be00` — die Adressform, weil
-   `=all` am Recompiler scheitert. Siehe
-   [Befehlsmenge](#zweite-kostenquelle-die-ausgeführte-befehlsmenge).
-3. **`0x80003e8700`** liegt nicht an Buffern. 16 Image-Fetches pro Invocation bei 46
-   Registern und 92 % Occupancy — Kandidat ist die Fetch-Arbeit selbst:
+1. **Die Front ist der Storage-Image-Pingpong, und sie ist jetzt belegt und lokalisiert.**
+   `cpuWrote` ist für alle drei Haupt-Targets zu **100 % 0**, zwei davon werden zweimal pro
+   Present hoch- und zurückgeschrieben, ohne dass CPU, Dirty-Flag oder DCC-Keys beteiligt
+   sind. Der Ausweg existiert (`Texture.cpp:1424`), ist aber durch `originalValid = false`
+   an `:1739` und `:2806` abgeschaltet. Obergrenze: **+48 % fps**. Nächster Schritt ist
+   **bauen**, nicht messen — Richtung unter
+   [Pingpong](#die-größte-front-der-storage-image-pingpong--belegt-und-lokalisiert).
+2. **Die Codemenge ist als Hebel erledigt**, in beide Richtungen: `SPIRV_OPT=full` bringt
+   1,4 %, `SINGLE_LANE` auf ein Programm kostet **+94 %** (symmetrisch für beide Shader).
+   Zwei Lanes sind das Optimum, nicht Ballast. Siehe
+   [Wave64](#wave64-emulation-hypothese-gefallen-2-lanes-sind-das-optimum).
+3. **`0x80003e8700`** liegt nicht an Buffern; 16 Image-Fetches pro Invocation bei 92 %
+   Occupancy sind der Kandidat:
    [zweiter Shader](#0x80003e8700-nicht-die-buffer-und-auch-nicht-pcie-bilder).
-4. Der **Carve-out** ist fertig und bleibt: 16 MiB gemessen, 4 MiB kostet 17 ms.
+4. Der **Carve-out** ist fertig: 16 MiB gemessen, 4 MiB kostet 17 ms.
 
 **Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
 
@@ -546,12 +548,11 @@ Der dritte ist eine gebrochene SSA-Invariante, also ein echter Defekt auf dem
 `laneCount=1`-Pfad — notierenswert, aber kein Blocker: die Adressform des Schalters
 umgeht ihn.
 
-## Die größte Front: der Storage-Image-Pingpong
+## Die größte Front: der Storage-Image-Pingpong — belegt und lokalisiert
 
-`APS5_GPU_NO_WRITEBACK=1` hält GPU-Ergebnisse aus dem Gastspeicher heraus. Als reine
-Obergrenze gemessen, und sie ist groß:
+`APS5_GPU_NO_WRITEBACK=1` als Obergrenze gemessen, und sie ist groß:
 
-| | Lauf 1 (Referenz) | Lauf 5 (`GPU_NO_WRITEBACK`) |
+| | Referenz | `GPU_NO_WRITEBACK` |
 |---|---|---|
 | Presents / 10 s | 82 (~8,2 fps) | **121 (~12,1 fps)**, +48 % |
 | GPU busy | 104,3 ms | **77,3 ms** |
@@ -560,44 +561,89 @@ Obergrenze gemessen, und sie ist groß:
 | `storage-writeback` | 14,68 ms (375 MiB) | **8,15 ms** (210 MiB) |
 | `0x800038be00` | 27,55 ms | 26,73 ms |
 
-Der Write-back kostet also nicht nur sich selbst: er halbiert auch die **Uploads** und
-drittelt die **Draws**. Zusammen ~27 ms pro Frame. Die beiden heißen Dispatches rühren
-sich nicht — die Fronten sind unabhängig.
+Der Write-back kostet nicht nur sich selbst: er halbiert die **Uploads** und drittelt die
+**Draws**. Zusammen ~27 ms pro Frame. Die heißen Dispatches rühren sich nicht.
 
-**Was der Trace sagt — und was nicht.** `APS5_TRACE_UPLOAD=1` liefert 6.505 Upload-Gründe:
-84 % „guest memory changed", 16 % „DCC keys changed", bei den häufigsten Auflösungen
-3840x2160 (36,7 %) und den häufigsten Adressen `0x5000860000+0x1fe0000` (491x, ein ~32-MiB-
-4K-Target). Es sind also **wenige große Rendertargets**, die Frame für Frame neu
-hochgeladen werden, nicht viele kleine Texturen.
+### Die Messung: `cpuWrote` ist zu 100 % 0
 
-**Aber „guest memory changed" ist keine Diagnose.** Der Trace druckt diesen String
-schlicht im else-Zweig (`Texture.cpp:1467`):
+`APS5_CAPTURE_TRACE=1` liefert die Zeile, die die Entscheidung trägt. 5.716
+`refresh`-Ereignisse über 152 Presents, **37,6 pro Present**, dazu 36,8 Uploads und 43,2
+Write-backs pro Present. Global: `cpuWrote` in **95,7 %** der Fälle 0, `dirty` in 80,9 %,
+`keysChanged` in 86,5 %.
+
+Für die drei Haupt-Targets, die sich in 151 von 152 Presents wiederholen:
+
+| Ziel | Auflösung | refresh/Present | up/back pro Present | `cpuWrote=0` | `dirty=0` | `keysChanged=0` |
+|---|---|---|---|---|---|---|
+| `0x5000860000` | 3840x2160 (~32 MiB) | 2,90 | 0,99 / 0,04 | **100 %** | 68,5 % | 67,3 % |
+| `0x50727e0000` | 1920x1080 (~8 MiB) | 1,99 | 2,00 / 1,99 | **100 %** | **100 %** | **100 %** |
+| `0x5060d30000` | 1920x1080 (~8 MiB) | 1,99 | 2,00 / 1,99 | **100 %** | **100 %** | **100 %** |
+
+Zwei Targets werden **zweimal pro Present** hochgeladen und zweimal zurückgeschrieben,
+obwohl weder die CPU sie anfasst, noch sie schmutzig sind, noch die DCC-Keys sich ändern.
+`generation` steigt jeden Present.
+
+### Die Ursache, auf drei Zeilen
+
+Es gibt einen Ausweg, und er ist abgeschaltet. `Texture.cpp:1424`:
 
 ```cpp
-keys != uploadedKeys ? "DCC keys changed" : "guest memory changed"
+if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
+    unchanged = true;   // Gastspeicher gleicht noch `original` -> kein Upload
 ```
 
-Die eigentliche Entscheidung fällt oberhalb davon im Pro-Layer-Vergleich, und im
-dominierenden Fall steht `dirty 0` — die Images sind also **nicht** als schmutzig
-markiert. Was sie als geändert einstuft, ist damit offen.
+`original` hält laut Kommentar „the guest bytes the image was last uploaded from **or
+written back as**". Genau dieser Vergleich würde den Pingpong abfangen — er verlangt aber
+`originalValid`, und das wird an zwei Stellen gelöscht:
 
-**Die Hypothese, die Lauf 5 stützt:** der Write-back schreibt die GPU-Ergebnisse in den
-Gastspeicher, die Write-Watch sieht die Blöcke als geschrieben, und der nächste Refresh
-hält genau diese Bytes für eine Gast-Änderung und lädt sie zurück. Ein Pingpong, in dem
-der Treiber seine eigenen Schreibzugriffe nicht von denen des Spiels unterscheidet. Dass
-Lauf 5 die Uploads **mit** halbiert, obwohl der Schalter nur den Write-back abschaltet,
-passt genau dazu.
+- `:1739` — im Host-Import-Pfad: `if (GuestMemory::Watched(...)) originalValid = false;`
+  Für ein Target unter Write-Watch gibt es also **nie** einen Baseline-Vergleich.
+- `:2806` — nach dem Write-back selbst, mit dem Kommentar *„the stamps make their next
+  Refresh re-upload, `original` no longer vouching for the bytes"*.
 
-**Die Gegenprobe ist klein:** `APS5_CAPTURE_TRACE=1` schaltet die Zeile
-`refresh image=... dirty=.. keysChanged=.. cpuWrote=..` frei (`Texture.cpp:1460`). Das
-Feld `cpuWrote` sagt direkt, ob ein CPU-Schreibzugriff die Ursache ist — und für die
-4K-Target-Adressen entscheidet es die Hypothese. Erst danach lohnt es, am Pfad zu bauen;
-die Maschinerie dafür (`Recorder::NoteWrittenBack`, `GuestMemory::StoredOver`,
-`stampedBlocks`) ist vorhanden. Auftrag:
-[`storage_pingpong_test_plan.md`](storage_pingpong_test_plan.md).
+Damit entscheidet allein die Block-Stempelung aus der Write-Watch, und die stempelt auch
+**unsere eigenen** Write-backs. Der Treiber kann seine Schreibzugriffe nicht von denen des
+Spiels unterscheiden, also lädt er zurück, was er selbst geschrieben hat. Der Trace zeigt
+genau das: `originalValid 0` im dominierenden Fall.
 
-**Kein Fix:** `APS5_GPU_NO_WRITEBACK=1` bricht die Korrektheit per Definition. Die 12,1 fps
+### Fix-Richtung
+
+Der Weg führt **nicht** über `equalsOriginal()` — dafür müssten die zurückgeschriebenen
+Bytes auf der CPU liegen, und genau diesen Readback will man sich sparen. Richtig ist die
+stärkere Aussage: **eine Unit, deren Stempel nur vom eigenen Write-back kommen, ist nicht
+geändert** — das Image *ist* die Quelle dieser Bytes. Gebraucht wird also eine
+Pro-Block-Notiz „von uns zurückgeschrieben bei Generation G", gegen die
+`UnchangedSince` / `ChangedBlocks` prüfen kann. Bausteine sind da: `NoteShadowSeed` im
+Write-back-Pfad, `GuestMemory::StoredOver`, `cpuBlocks` getrennt von `stampedBlocks`.
+
+Die Schwierigkeit ist die Reihenfolge: die Stempel des Write-backs landen **asynchron**
+auf der GPU, die Notiz muss also die Generation *nach* dem Landen tragen — dafür ist die
+Pending-Results-Maschinerie (`layerPending`, `pendingChanged`) der Ankerpunkt.
+
+**Kein Fix:** `APS5_GPU_NO_WRITEBACK=1` bricht die Korrektheit per Definition. 12,1 fps
 sind eine Obergrenze, keine Zielmarke.
+
+## Wave64-Emulation: Hypothese gefallen, 2 Lanes sind das Optimum
+
+`APS5_SINGLE_LANE=<hex>` trifft nur ein Programm (die `=all`-Form war an fremden Shadern
+gescheitert). Mit der Adressform bleiben die drei Recompiler-Fehler aus, und der Code
+halbiert sich wie erwartet (162.427 → 85.261 Words).
+
+| Lauf | `0x800038be00` | `0x80003e8700` |
+|---|---|---|
+| Referenz | 27,55 ms | 19,89 ms |
+| `SINGLE_LANE=800038be00` | **53,47 ms** (+94 %) | 19,70 ms |
+| `SINGLE_LANE=80003e8700` | 27,09 ms | **39,58 ms** (+99 %) |
+
+**Symmetrisch, exakt 2x, und nur beim adressierten Programm.** Halber Code, doppelte
+Laufzeit. Die 2-Lane-Entrollung ist also **kein Ballast, sondern die bessere Wahl**: bei
+`laneCount=1` braucht eine Gast-Wave64 zwei Warps statt einen, und wave-interne Operationen
+werden aus billigen Intra-Warp-Subgroup-Ops zu teuren Workgroup-Barrieren.
+
+**Damit ist die Codemenge als Hebel in beide Richtungen erledigt:** mehr Optimierung bringt
+1,4 %, halber Code kostet 94 %. Was von den 27,6 ms bleibt, ist die Arbeit des
+Gast-Algorithmus selbst plus der Pro-Zugriff-Overhead — und der Flaschenhals ist damit
+möglicherweise näher an seinem Boden als der Rest des Frames.
 
 ## Upstream-Abgleich (Stand 13.10.)
 
