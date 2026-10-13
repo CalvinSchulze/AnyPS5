@@ -36,14 +36,18 @@ belegt — aber nur für **~60 %** der Kosten, und der Eingriff selbst ist unbra
 (1,2 fps). Zahlen und Vorbehalte unter
 [Eingriffs-Test](#eingriffs-test-ursache-belegt-fix-noch-nicht).
 
-**Erster Schritt morgen:** die Fix-Richtung entscheiden. Das Mirroring der ganzen Arena
-ist zu teuer, das Written-Shadow-Staging ist für adressierbare Builds gesperrt. Die
-offene Frage ist, ob sich die BDA-Zeiger auf einen gestagten device-lokalen Puffer
-**umschreiben** lassen — siehe [Fix-Richtung](#fix-richtung-offene-frage).
+**Erster Schritt:** die Fix-Richtung ist entschieden und der Riegel benannt. Nicht die
+Device-Adresse fehlt dem Staging — `addressRange` veröffentlicht einen Region-Puffer
+längst —, sondern das `Write`-Permission-Bit, das nur in place gebundene Ranges bekommen.
+Drei kleine Eingriffe, siehe
+[Fix-Richtung](#fix-richtung-der-riegel-ist-das-write-bit-nicht-die-device-adresse).
 
 **Zweite offene Front:** nach dem Eingriff bleiben 27,6 ms pro Dispatch = 3,33 ms pro
 Mio. Invocations, immer noch 50–250x über den billigen 4K-Pässen. Da sitzt eine
-**zweite, unabhängige Kostenquelle**, die wir noch nicht kennen.
+**zweite, unabhängige Kostenquelle**. Hauptverdächtiger ist jetzt der
+**Lookup pro Zugriff** — eine nicht inlinebare Binärsuche über die Range-Tabelle, plus
+Device-Scope-Atomics pro Store; gelesen, nicht gemessen, mit Messplan unter
+[zweite Kostenquelle](#verdacht-auf-die-zweite-kostenquelle-der-lookup-pro-zugriff).
 
 **Nicht erneut prüfen** — jedes mit Messung ausgeschlossen:
 
@@ -362,23 +366,96 @@ Taktzustände, Cache-Residenz und fehlende Parallelarbeit unterscheiden sich dam
 der Basislinie; die Richtung und die Selektivität der Signatur sind überzeugend, die
 genauen Faktoren 2,4x und 6,4x sind weich.
 
-### Fix-Richtung (offene Frage)
+### Fix-Richtung: der Riegel ist das Write-Bit, nicht die Device-Adresse
 
 Gebraucht wird device-lokale Ablage **nur für die Ranges, die der heiße Shader wirklich
 anfasst** — nicht für die ganze Arena. Genau das tut das Written-Shadow-Staging, und es
 ist für adressierbare Builds gesperrt, laut Kommentar in `:2148` weil
 „AddressRanges needs a device address".
 
-Ein device-lokaler Staging-Puffer **hat** aber eine Device-Adresse. Die offene Frage ist
-deshalb, ob sich in der BDA-Tabelle die Adresse des Stagings statt der des Imports
-veröffentlichen lässt (`AddressRanges`, `BdaResources.cpp`, die
-`ShaderRecompiler::BdaAbi::Range`-Liste in `:1866`). Gelingt das, greift die Staging-
-Logik mitsamt ihrem Größenfenster für genau die sechs geschriebenen Buffer, ohne die
-Arena zu spiegeln.
+**Der Kommentar trägt nicht mehr.** Im Code gelesen (`GuestBufferMemory.cpp:2880`):
+
+```cpp
+const auto address = region.direct != nullptr ? ... : region.mirror != nullptr ? ... : region.buffer->DeviceAddress();
+const auto permissions = Read | (region.direct != nullptr && region.writable ? Write : 0u);
+```
+
+`addressRange` **veröffentlicht schon heute** die Device-Adresse eines eigenen
+Region-Puffers, und `gpuCopyUsage(addressable)` (`:2157`) hängt dem Staging-Puffer
+`SHADER_DEVICE_ADDRESS_BIT` an, wenn der Build adressierbar ist. `AddressRanges()`
+(`:2888`) nimmt *alle* `regions` auf, nicht nur die in place gebundenen. Eine gestagte
+Region ist also publizierbar — die Adresse ist nicht das Problem.
+
+Das Problem ist das **Permission-Bit**: `Write` wird nur für `region.direct != nullptr`
+gesetzt, also nur für in place im Import gebundene Ranges. Eine gestagte Region käme als
+**read-only** in die Tabelle, und jeder BDA-Store dagegen würde in
+`get_bda_write_pointer` an `FaultReason::Permission` scheitern.
+
+Der Eingriff ist damit klein und benannt:
+
+1. `stagingEligible` (`:2295`) das `addressable` aus dem Early-Return nehmen — gezielt,
+   nicht pauschal (siehe Sweep-Heuristik unten).
+2. In `addressRange` das `Write`-Bit auch für eine gestagte Region setzen (`gpuCopy` und
+   `deviceLocal`), deren Bytes `RecordCopyBacks` zurückschreibt.
+3. Das Fenster auf die wirklich gefegten Ranges begrenzen, statt `MAX_KIB` hochzudrehen.
 
 Zu klären, bevor etwas gebaut wird: ob Gast-Zeiger-Arithmetik im Shader über
-Range-Grenzen hinweg rechnet (dann bricht ein Remap), und wie die Rück-Kopie mit den
-`direct`-Schreibmarken und der Pending-Write-Notiz zusammenspielt.
+Range-Grenzen hinweg rechnet (dann bricht ein Remap — der Lookup in `SpirvBdaLookup.cpp`
+sucht pro Zugriff die *eine* Range, die alle Bytes hält, ein Zugriff über die Grenze
+faultet also ohnehin schon), und wie die Rück-Kopie mit den `direct`-Schreibmarken und
+der Pending-Write-Notiz zusammenspielt.
+
+## Verdacht auf die zweite Kostenquelle: der Lookup pro Zugriff
+
+Noch nicht gemessen, aber aus dem Emitter gelesen und passend zu allem, was die Tabelle
+oben zeigt. Jeder BDA-Zugriff ruft `get_bda_pointer` (`SpirvBdaLookup.cpp:21`), und diese
+Funktion ist
+
+- mit `FunctionControlDontInlineMask` deklariert — der Treiber kann sie nicht inlinen,
+  nicht hoisten, nicht über Zugriffe hinweg zusammenfassen,
+- eine **Binärsuche über die publizierte Range-Tabelle** mit `low`/`high` in
+  `StorageClassFunction`-Variablen, pro Iteration ein `OpLoad` aus dem Pagetable-Puffer
+  (bei 856 Ranges ~10 Iterationen),
+- gefolgt von ~10 Validierungszweigen (Version, Entry-Size, Permissions, Overflow).
+
+Und jeder BDA-**Store** ruft zusätzlich `note_bda_write` (`:118`): eine Hash-Probe-Schleife
+über den Fault-Buffer mit `OpAtomicLoad` und `OpAtomicCompareExchange` auf
+**Device-Scope**, pro Store.
+
+Das erklärt genau das, was kein statisches Attribut erklärt hat: Kosten skalieren mit der
+Zahl der **Zugriffe pro Invocation**, nicht mit Buffer-Zahl, Codegröße oder BDA-Präsenz
+allein. 8,29 Mio. Invocations mal mehrere Zugriffe mal (Binärsuche + Atomics) ist
+Overhead pro Zugriff — und das passt zu den gemessenen ~0,5 GB/s effektiver Bandbreite.
+
+Upstream rührt diesen Lookup **nicht** an (nachgesehen: nur `f1b2e605e`, `803a13127`,
+`e7b4c0554`, `73e0890c2`, `c0348a02b`, alle Korrektheit, `note_bda_write` wird dabei sogar
+teurer). Das Feld ist also unbesetzt.
+
+**Messplan, bevor etwas gebaut wird:** Zahl der BDA-Zugriffe pro Invocation aus dem
+SPIR-V zählen (`OpFunctionCall` auf `get_bda_pointer` / `get_bda_write_pointer` im
+Entry-Code, gewichtet mit den Schleifen-Trip-Counts) und gegen `ms/Mio. Inv` der elf
+Programme auftragen. Wenn das der Prädiktor ist, den die statischen Attribute nicht
+hergaben, ist die Richtung belegt, bevor eine Zeile Emitter angefasst wird.
+
+## Upstream-Abgleich (Stand 13.10.)
+
+`I:\Emulation\PS5 Emu\Software\AnyPS5Source` hält Upstream-`main`
+(`boykopovar/AnyPS5`). **Keine gemeinsame Historie** mit unserem Repo — die
+Upstream-Arbeit kam als ein Squash-Commit herein, also kein `merge-base`, kein
+Cherry-Pick. Vergleich nur über Blob-Hashes pro Datei (`git hash-object` gegen
+`git rev-list main -- <datei>`). Basis am 13.10.: `GuestBufferMemory.cpp` entspricht
+`c11a9cb59` (10.10.), der SPIR-V-Backend-Stand ist älter (`b2a481330`, 08.10.).
+
+Drei Upstream-Commits berühren unsere Front:
+
+| Commit | Was | Für uns |
+|---|---|---|
+| `2688b7646` perf(agc): stage read and written buffer elements a dispatch sweeps | Weitet das Written-Shadow-Fenster für **gefegte** Elemente auf 16 MiB: gelesen *und* geschrieben (`bufferRead`), direkter Dispatch, Threads x Stride decken ≥ die Hälfte des Elements. Gemessen 4,8 ms → 0,06 ms + 0,9 ms Kopien. | Bestätigt Mechanismus und Methode unabhängig von uns, **hilft unseren beiden heißen Shadern aber nicht**: `stagingEligible` behält `addressable` im Early-Return. Die Sweep-Heuristik ist genau das Fenster-Kriterium, das wir brauchen — übernehmen. |
+| `d220f48e9` perf(shader): load from buffers without Coherent when the load has no GLC or DLC | Ein einziger GLC/DLC-Zugriff dekorierte das **ganze** Buffer-Array `Coherent`; auf NVIDIA fallen damit alle Loads aus dem L1. Gemessen **2,7x** langsamer. Fix: zweites Array `buffers_coherent`. | **Nicht in unserem Baum** (`coherentBufferAlias`, `storageBufferCoherentVariable` fehlen). Trifft den Deskriptor-Array-Pfad, nicht BDA — also nicht unseren Flaschenhals, aber ein heißer Kandidat für `0x8000269d00`, das pro Invocation teuerste Programm **ohne** BDA (16,172 ms/Mio.). RTX 5080 ist NVIDIA. |
+| `2fb7a77ac` feat(shader): note which guest buffer elements a shader loads from | `DescriptorBinding::bufferRead` neben `bufferWritten`/`bufferAtomic`, Shader-Cache-Format 24. | Voraussetzung für die Sweep-Heuristik; fehlt uns ebenfalls. |
+
+Was upstream **nicht** angefasst hat: der `addressable`-Riegel in `stagingEligible` und
+die Binärsuche in `get_bda_pointer`. Beide Fronten sind unbesetzt.
 
 ## Nachgelagert (nicht starten, bevor das aktive Ziel steht)
 
