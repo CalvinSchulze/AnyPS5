@@ -7,10 +7,82 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
 static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
 static std::mutex g_equeueMutex;
 static uint64_t g_nextEqueue = 1;
+
+// APS5_TRACE_EQUEUE=1: one line per live event queue every ten seconds, with its name, the
+// threads waiting in it right now, the waits it has served, the timeouts and the events ever
+// delivered to it. A queue that has a waiter and has never received an event is a wake-up that
+// never comes - the one shape no other instrument here shows, because KernelTraceWait reports
+// only waits that *finish* and a thread parked forever produces no line at all. The report runs
+// on its own thread for the same reason: it must speak while nothing moves.
+namespace {
+
+struct EqueueStats {
+    std::atomic<std::uint64_t> waits{0};
+    std::atomic<std::uint64_t> timeouts{0};
+    std::atomic<std::uint64_t> events{0};
+    std::atomic<std::int64_t> waiting{0};
+};
+
+std::mutex g_statsMutex;
+std::unordered_map<KernelEqueue, std::shared_ptr<EqueueStats>> g_stats;
+
+void ReportEqueues() {
+    std::vector<std::pair<std::string, std::pair<KernelEqueue, std::shared_ptr<EqueueStats>>>> rows;
+    {
+        std::lock_guard lock(g_equeueMutex);
+        std::lock_guard statsLock(g_statsMutex);
+        for (const auto& [handle, ref] : g_equeues) {
+            const auto found = g_stats.find(handle);
+            if (found == g_stats.end() || !ref) continue;
+            rows.emplace_back(ref->GetName(), std::make_pair(handle, found->second));
+        }
+    }
+    for (const auto& [name, entry] : rows) {
+        const auto& stats = *entry.second;
+        std::fprintf(stderr, "[equeue] \"%s\" handle=%llu waiting=%lld waits=%llu timeouts=%llu events=%llu\n", name.c_str(),
+            static_cast<unsigned long long>(entry.first), static_cast<long long>(stats.waiting.load()),
+            static_cast<unsigned long long>(stats.waits.load()), static_cast<unsigned long long>(stats.timeouts.load()),
+            static_cast<unsigned long long>(stats.events.load()));
+    }
+}
+
+bool EqueueTraceEnabled() {
+    static const bool enabled = [] {
+        const bool on = std::getenv("APS5_TRACE_EQUEUE") != nullptr;
+        if (on) {
+            std::fprintf(stderr, "[equeue] tracing enabled\n");
+            std::thread([] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(10));
+                    ReportEqueues();
+                }
+            }).detach();
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+std::shared_ptr<EqueueStats> StatsFor(KernelEqueue eq) {
+    if (!EqueueTraceEnabled()) return nullptr;
+    std::lock_guard lock(g_statsMutex);
+    auto& slot = g_stats[eq];
+    if (!slot) slot = std::make_shared<EqueueStats>();
+    return slot;
+}
+
+}
 
 extern "C" {
 
@@ -265,6 +337,7 @@ int APS5_VABI EqueueAddEvent_nid_postfix(KernelEqueue eq, const KernelEqueueEven
 }
 
 int APS5_VABI EqueueTriggerEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, int16_t filter, void* triggerData) {
+    if (const auto stats = StatsFor(eq)) stats->events.fetch_add(1, std::memory_order_relaxed);
     auto owner = EqueuePin_nid_postfix(eq);
     if (!owner) {
         return SCE_KERNEL_ERROR_EBADF;
@@ -322,6 +395,15 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
     if (num < 1 || out == nullptr) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
+    const auto stats = StatsFor(eq);
+    if (stats) {
+        stats->waits.fetch_add(1, std::memory_order_relaxed);
+        stats->waiting.fetch_add(1, std::memory_order_relaxed);
+    }
+    struct WaitingGuard {
+        const std::shared_ptr<EqueueStats>& stats;
+        ~WaitingGuard() { if (stats) stats->waiting.fetch_sub(1, std::memory_order_relaxed); }
+    } waitingGuard{stats};
     const auto waitStart = std::chrono::steady_clock::now();
     if (timo == nullptr) {
         *out = owner->WaitForEvents(ev, num, 0);
@@ -336,6 +418,7 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
     if (*out == SCE_KERNEL_ERROR_EBADF) {
         return SCE_KERNEL_ERROR_EBADF;
     }
+    if (stats && *out == 0) stats->timeouts.fetch_add(1, std::memory_order_relaxed);
     if (*out == 0) {
         return SCE_KERNEL_ERROR_ETIMEDOUT;
     }

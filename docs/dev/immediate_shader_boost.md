@@ -55,12 +55,22 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 > | fehlende Datei | alle 7 Open-Versuche protokolliert, keiner scheitert |
 > | Geschwindigkeit | `TIME_SCALE` 0,3 und 0,15 ändern nichts |
 >
-> **Die Methode ist am Ende, nicht die Spur.** Was bleibt, liegt in der Logik des Titels und
-> hängt an einer Antwort, die wir still falsch geben. Um das zu sehen, bräuchte es einen
-> **Aufrufzähler über alle HLE-Exporte** — den gibt es nicht, und er verlangt einen Eingriff
-> in den NID-Patcher. Die billigere Alternative ist ein **Vergleichstitel**, der sein Menü
-> erreicht: der Unterschied im Aufrufmuster zeigt die Lücke schneller als jedes weitere
-> Einzelinstrument.
+> **Noch zwei Dinge erledigt, beide schnell:** die Sprache ist es nicht (wir melden
+> `ENGLISH_US`, und die englischen Archive haben Daten — von 5593 `.larc`-Dateien sind 4055
+> leer, aber en/fr/ja nicht), und der Titel liest aus dem **522 MB großen `noloc.larc`**
+> genau 9,0 MiB, also den Film, und dann nichts mehr.
+>
+> **Der Aufrufzähler über alle HLE-Exporte ist zu teuer:** der NID-Patcher müsste Code in die
+> PE-Dateien generieren, und das gefährdet die Ladbarkeit jedes Moduls. Gezielter und
+> billiger ist die Form, die zur verbleibenden Lage passt: **drei Threads parken dauerhaft in
+> `sceKernelWaitEqueue`, und kein NP- oder Trophy-Modul von uns ruft je
+> `EqueueTriggerEvent`.** Ein dort erwartetes Ereignis käme also nie — und kein bisheriges
+> Instrument zeigt das, weil `APS5_TRACE_WAITS` erst meldet, *wenn* ein Warten endet.
+>
+> **Neu gebaut: `APS5_TRACE_EQUEUE=1`** gibt alle zehn Sekunden aus einem eigenen Thread je
+> eine Zeile pro Event-Queue aus — Name, wie viele Threads **jetzt** darin hängen, Waits,
+> Timeouts, je zugestellte Ereignisse. `waiting>=1` bei `events=0` über Minuten ist das
+> gesuchte Bild.
 >
 > Die fps-Operation unten ist davon unabhängig und bleibt gültig; Prognose in
 > [`frame_budget_roadmap.md`](frame_budget_roadmap.md).

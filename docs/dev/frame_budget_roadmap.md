@@ -52,7 +52,9 @@ eine Mechanik, die im Baum schon existiert und nur nicht greift.
 Image *und* linearer Gast-Buffer; `0x80003e8700` bindet sie als Buffer, je zweimal pro
 Present lesend und schreibend. Daraus folgen 2 Write-backs und 2 Uploads pro Fläche, 93 %
 aller Write-backs mit `reason=storage refresh`. Der Ausweg heißt `borrowUnits` und wird von
-einer von sechs Klauseln verweigert — welche, sagt eine risikolose Trace-Ergänzung.
+einer von sechs Klauseln verweigert. **Welche, sagt jetzt `APS5_TRACE_ALIAS=1`**: eine Zeile
+pro Fläche und Grund, gebaut und ohne Verhaltensrisiko. Klauseln 2–5 sind Zustände, die man
+herstellen kann, Klausel 6 (eine Unit in beiden Images pending) wäre eine echte Ambivalenz.
 Obergrenze gemessen: **+48 % fps** (`APS5_GPU_NO_WRITEBACK=1`, kaputter Zustand, nur als
 Schranke).
 
