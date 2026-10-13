@@ -20,6 +20,17 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
+## Vorrang: erst das 3D-Hauptmenü, dann fps
+
+> Das Ziel ist das **3D-Hauptmenü**, das bisher nie zu sehen war. Dieses Dokument führt die
+> fps-Operation — sie **wartet**, bis geklärt ist, ob der Titel die Szene schon rendert.
+> Die Telemetrie spricht dafür: 25 Draws und 12 Compute-Programme pro Present, 19 Images
+> pro Dispatch, 4K-Targets mit DCC, ein Froxel-Culling-artiger Voll-4K-Pass, `fill-clear`
+> über 140 MiB pro Present. Ein Videodecoder braucht davon nichts. Entweder erreicht das
+> Gerenderte den Schirm nicht, oder die Szene kriecht bei 8,3 fps so langsam, dass es wie
+> Stillstand aussieht. Auftrag dazu:
+> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md).
+
 ## Hier morgen weitermachen
 
 **Stand:** `0x800038be00` ist als **Pro-Invocation-Ausreißer** eingekreist — 8,002 ms pro
