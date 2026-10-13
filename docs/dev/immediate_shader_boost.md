@@ -20,30 +20,35 @@ GPU-Zeit ist extrem schief verteilt (6059 ms pro 10 s):
 | `0x80003e8700` | 1240 ms | 20 % | 19 ms |
 | 10 weitere zusammen | 505 ms | 8 % | — |
 
-## Vorrang: die Filmwiedergabe stockt, und zwar an wechselnder Stelle
+## Vorrang: die Filmwiedergabe stockt — und 9 fps sind der Hauptverdächtige
 
-> **Korrektur der letzten Lesart.** „Ein 5-Sekunden-Clip läuft zu Ende" war falsch. Der
-> nächste Lauf zeigt **457 Dekodier-Aufrufe und 455 Bilder** statt 152/150 — die Zahl ist
-> nicht fest. Und `flushes` wie `deletes` bleiben **0**: der Titel baut den Decoder **nie**
-> ab. Die Wiedergabe **stockt** also, sie endet nicht.
+> **Der Anzeigepfad ist gesund, und die schwarzen Frames waren ein Messfehler von mir.**
+> `[flip]` aus `VulkanDevice.cpp:2271` zeigt **1931 Presents aus dem residenten Image**,
+> 1 „unsuitable", 0 „not pending". Das Bild kommt also aus dem device-lokalen Image, das die
+> GPU bemalt. Und die 30 schwarzen Frame-Dumps lagen bei Present 10 bis 300, also in den
+> **ersten ~33 Sekunden** — der Film startet erst bei Logzeile ~4050, nach ~40 s. Wir haben
+> schwarz gemessen, weil wir vor dem Film geschaut haben. Dreimal darauf aufgebaut, dreimal
+> umsonst.
 >
-> **Erledigt:** `sceSystemServiceReceiveEvent` wird **nie** aufgerufen (`[sysevent]` = 0),
-> die System-Event-Pumpe ist kein Gate. Dazu aus dem Code: AIO ist synchron und kann nicht
-> hängen, Flip- und Vblank-Events werden geliefert, der Decoder liefert Bilder bei 1920x1080.
+> **Mein `[flip]`-Hook in `libSceVideoOut` feuerte nie:** der Titel flippt nicht über
+> `sceVideoOutSubmitFlip`, sondern über den **PM4-Flip-Paketpfad** des AGC-Treibers (passend
+> zu `flip x82` in den `[packets]`-Zeilen). Das Instrument saß im falschen Modul.
 >
-> **Wohin das zeigt:** eine Film-Pipeline, die ohne Abbau stehenbleibt, hängt an der
-> **Ausgabeseite** — die dekodierten Bilder werden nicht abgeholt, die Warteschlange füllt
-> sich, der Titel schickt nichts mehr nach. Und genau dort ist unsere Lücke: präsentierte
-> Frames schwarz, `APS5_DUMP_TARGETS` schreibt 0 Dateien.
+> **Was bleibt:** die Filmwiedergabe **stockt** an wechselnder Stelle (152 Bilder im einen
+> Lauf, 455 im nächsten) und wird **nie abgebaut** (0 flushes, 0 deletes). Danach keine
+> Lesevorgänge mehr, keine neuen Shader, Worker im Leerlauf.
 >
-> **Neu gebaut:** `APS5_TRACE_FLIP=1` trennt die zwei Fragen, die der Frame-Dump
-> zusammenwirft — ob der Titel **echte** Puffer flippt oder die Sonderindizes BLACK (−2) und
-> BLANK (−1), die per Definition schwarz sind, und ob ein echter Puffer im Gastspeicher
-> **nicht null** ist. Ist er nicht null und präsentieren wir trotzdem schwarz, verlieren wir
-> das Bild; ist er null, hat der Titel nichts gezeichnet.
+> **Der Hauptverdächtige ist jetzt die Geschwindigkeit selbst.** Der Titel läuft mit ~9 fps
+> und erwartet 30 oder 60 — ein 30-fps-Film lässt sich bei 9 fps nicht abfließen, die
+> Warteschlange füllt sich, und der Titel wartet auf ein Ende, das nie kommt. Das wäre eine
+> mundane und vollständige Erklärung, und sie verbindet beide Baustellen: dann **ist** die
+> fps-Arbeit der Weg zum Menü.
 >
-> Auftrag: [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md). Die fps-Operation unten
-> bleibt pausiert, Prognose in [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
+> **Der Test braucht keinen Build:** `APS5_TIME_SCALE=<faktor>` verlangsamt die Gast-Uhren
+> (`libkernel/Time/Time.cpp:57`), damit der Titel „plausible frame times" sieht. 0,3 ≈ ein
+> 30-fps-Takt, 0,15 ≈ 60. Kommt der Film damit durch, ist die Frage beantwortet. Auftrag:
+> [`menu_blocker_test_plan.md`](menu_blocker_test_plan.md); Prognose für die fps-Seite in
+> [`frame_budget_roadmap.md`](frame_budget_roadmap.md).
 
 ## Hier morgen weitermachen
 
