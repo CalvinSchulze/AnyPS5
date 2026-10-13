@@ -1310,6 +1310,37 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         const auto dropped = AddressSpaceCounters();
         if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == dropped.waiterDrops, "the free did not drop the cached address space");
     }
+    {
+        // A swept element is carved out of the base region that would otherwise serve it
+        // (GuestBufferMemory::addDescriptorRegion), and the elements of a dispatch sit back to
+        // back: the carve-out ends exactly where the next element begins. The owner of that next
+        // address is the base region, not the carve-out that merely begins below it.
+        void* block = GuestHeap::GuestHeapAllocate_nid_postfix(0x18000);
+        const auto blockAddress = reinterpret_cast<std::uintptr_t>(block);
+        std::memset(block, 0x3c, 0x18000);
+        GuestBufferMemory carved(context);
+        carved.AcquireRegistered();
+        carved.AllowDeviceStaging();
+        // Swept, inside the written-shadow window: taken out of the base region.
+        carved.AddWritable(blockAddress, 0x8000, false, true);
+        // Not swept: left to the base region, which still holds it.
+        carved.AddWritable(blockAddress + 0x8000, 0x8000);
+        carved.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto behind = carved.Descriptor(blockAddress + 0x8000, 4, adjustment);
+        Require(behind.range == 4 + adjustment, "the element behind a carve-out has no descriptor");
+        const auto inside = carved.Descriptor(blockAddress, 4, adjustment);
+        Require(inside.range == 4 + adjustment, "a carved-out element has no descriptor");
+        // The table the lookup binary-searches: ascending and disjoint, with the carved span taken
+        // out of the base range rather than published twice.
+        const auto ranges = carved.AddressRanges();
+        for (std::size_t index = 1; index < ranges.size(); ++index) {
+            Require(ranges[index - 1].end <= ranges[index].begin, "a carve-out left the BDA table overlapping");
+        }
+        Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == blockAddress; }), "the carved span is missing from the BDA table");
+        carved.WriteBack();
+        GuestHeap::GuestHeapFree_nid_postfix(block);
+    }
     importCrossingTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);
