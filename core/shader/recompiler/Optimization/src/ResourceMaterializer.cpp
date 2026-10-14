@@ -226,7 +226,31 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     return decoded;
 }
 
-constexpr std::uint32_t TableEntryBytes = 32;
+// The bytes a T# occupies inside a table entry: an R128 descriptor is 128 bit. Where it sits
+// inside the entry -- an entry holding an S# and an R128 T# puts the T# at +16 -- is the planner's
+// `entryOffset`, and how far apart the entries lie is its `entryStride`.
+constexpr std::uint32_t DescriptorBytes(bool r128) {
+    return r128 ? 16u : 32u;
+}
+
+// The slots one table binds. A table image costs `slots - 1` image resources more than a static
+// one and they all come out of the shader's sampled heap, so a shader with several tables gets
+// fewer slots each rather than no table at all. A pure function of the shader's own counts, so
+// the static interface and the materialization arrive at the same number without passing it on.
+std::uint32_t tableSlots(std::size_t directImages, std::size_t tableCount) {
+    if (tableCount == 0u) return RuntimeAbi::BindlessTableSlots;
+    const std::size_t spare = ShaderInfo::MaxImages > directImages ? (ShaderInfo::MaxImages - directImages) / tableCount : 0u;
+    return std::max<std::uint32_t>(1u, std::min<std::uint32_t>(RuntimeAbi::BindlessTableSlots, static_cast<std::uint32_t>(1u + spare)));
+}
+
+template <typename Sources, typename Images>
+std::uint32_t tableSlotsOf(const Sources& sources, const Images& images) {
+    std::size_t tables = 0;
+    for (const auto& image : images) {
+        if (image.source < sources.size() && sources[image.source].indirectImage.has_value()) tables++;
+    }
+    return tableSlots(images.size(), tables);
+}
 
 std::uint32_t MaterialScanLimit() {
     static const std::uint32_t limit = [] {
@@ -316,7 +340,7 @@ void traceTable(const IrResourcePlan& plan, const ImageResource& image, const De
 
 // The slots of the table image `imageIndex` (see TableResolution). Mode M enumerates the keys the
 // dispatch can reach from the material records; mode T binds the whole table when it fits.
-void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution) {
+void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, std::uint32_t slots, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution) {
     const auto& image = plan.info.images.at(imageIndex);
     if (runtime.readMemory == nullptr) {
         throw std::runtime_error("bindless image table resolution requires runtime memory access");
@@ -327,14 +351,24 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (image.packed || image.byElements != 0u) {
         throw std::runtime_error("bindless packed and BY2/BY4 image tables are unsupported");
     }
-    const auto slots = ResourceMaterializer::BindlessSlots();
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
     const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
     const std::uint64_t heapSize = heap.GetSize();
     if (heap.Type() != 0u || heap.Base48() > std::numeric_limits<std::uint64_t>::max() - heapSize) throw std::runtime_error("bindless heap buffer is invalid");
-    if (heapSize != 0u && (heapSize < table.entryOffset || (heapSize - table.entryOffset) % TableEntryBytes != 0u)) throw std::runtime_error("bindless heap contains a partial descriptor");
-    const auto entries = heapSize > table.entryOffset ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset) / TableEntryBytes, std::numeric_limits<std::uint32_t>::max())) : 0u;
+    // The keys the table holds are the entries whose descriptor lies wholly inside the heap, so the
+    // descriptor's end is what bounds them.
+    const std::uint32_t descriptorBytes = DescriptorBytes(image.r128);
+    const std::uint32_t entryStride = table.entryStride;
+    if (entryStride < descriptorBytes || entryStride % sizeof(std::uint32_t) != 0u) throw std::runtime_error("bindless image table strides its entries by " + std::to_string(entryStride) + " bytes, which holds no " + std::to_string(descriptorBytes) + " byte descriptor");
+    const std::uint64_t descriptorEnd = static_cast<std::uint64_t>(table.entryOffset) + descriptorBytes;
+    if (heapSize != 0u && heapSize < descriptorEnd) throw std::runtime_error("bindless heap of " + std::to_string(heapSize) + " bytes holds no descriptor at offset " + std::to_string(table.entryOffset));
+    // A table whose descriptors start at an entry boundary is a descriptor heap, and a heap that
+    // ends inside an entry is one we are reading wrong, so that stays rejected. Where the
+    // descriptor sits inside a larger entry -- a record carrying an S# and a T#, say -- the bytes
+    // behind the last descriptor are the rest of its record, and say nothing.
+    if (heapSize != 0u && table.entryOffset % entryStride == 0u && (heapSize - table.entryOffset) % entryStride != 0u) throw std::runtime_error("bindless heap contains a partial descriptor");
+    const auto entries = heapSize >= descriptorEnd ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - descriptorEnd) / entryStride + 1u, std::numeric_limits<std::uint32_t>::max())) : 0u;
     const auto readWord = [&](std::uint64_t address, std::uint32_t& word) {
         if (!runtime.readMemory(runtime.userContext, address, &word)) {
             throw std::runtime_error("failed to read a bindless image table from memory");
@@ -389,11 +423,15 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     std::vector<DescriptorValue> candidates(keys.size());
     std::vector<std::uint8_t> valid(keys.size(), 0u);
     std::uint32_t paddedNull = 0u;
+    const std::uint32_t descriptorWords = descriptorBytes / sizeof(std::uint32_t);
     for (std::size_t i = 0u; i < keys.size(); ++i) {
         auto& candidate = candidates[i];
         candidate.dwordCount = 8u;
-        const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * TableEntryBytes;
-        for (std::uint32_t dword = 0u; dword < 8u; ++dword) readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+        const std::uint64_t address = heapBase + table.entryOffset + static_cast<std::uint64_t>(keys[i]) * entryStride;
+        for (std::uint32_t dword = 0u; dword < descriptorWords; ++dword) readWord(address + dword * sizeof(std::uint32_t), candidate.dwords[dword]);
+        // The padding a static R128 T# gets from the translation, so the decode below sees one
+        // descriptor shape either way.
+        for (std::uint32_t dword = descriptorWords; dword < 8u; ++dword) candidate.dwords[dword] = 0u;
         if (nullImageDescriptor(candidate)) {
             ++paddedNull;
             continue;
@@ -418,6 +456,54 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     counters.keys.fetch_add(resolution.mapping.size(), std::memory_order_relaxed);
     counters.paddedNull.fetch_add(paddedNull, std::memory_order_relaxed);
     if (BindlessTraced()) traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size())});
+}
+
+// An S# the shader loads out of the same table entries as the T# it samples with. The slots are
+// bound as one image array against one sampler, so every entry the image bound has to carry the
+// same sampler state -- the keys in the image's resolution are the entries to look at.
+void resolveTableSampler(const IrResourcePlan& plan, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, const std::vector<TableResolution>& tables, DescriptorValue& resolved) {
+    if (runtime.readMemory == nullptr) throw std::runtime_error("bindless sampler table resolution requires runtime memory access");
+    // The entries to look at are the ones the image of this table bound -- the same table, read at
+    // another offset in the entry -- which the planner guarantees exists.
+    const auto sameTable = [&](const DescriptorSource::IndirectImage& other) {
+        return other.heapSource == table.heapSource && other.entryStride == table.entryStride && other.hasMaterial == table.hasMaterial
+            && other.materialSource == table.materialSource && other.selectorStride == table.selectorStride && other.selectorOffset == table.selectorOffset;
+    };
+    const TableResolution* resolution = nullptr;
+    for (std::uint32_t i = 0; i < plan.info.images.size() && i < tables.size(); i++) {
+        const auto& source = plan.descriptorSources.at(plan.info.images[i].source);
+        if (source.indirectImage.has_value() && sameTable(*source.indirectImage)) {
+            resolution = &tables[i];
+            break;
+        }
+    }
+    if (resolution == nullptr) throw std::runtime_error("a bindless sampler's table has no image to take its keys from");
+    constexpr std::uint32_t SamplerBytes = 4u * sizeof(std::uint32_t);
+    if (table.entryStride < SamplerBytes) throw std::runtime_error("bindless sampler table strides its entries by " + std::to_string(table.entryStride) + " bytes, which holds no sampler");
+    DescriptorValue heapValue;
+    walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
+    const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
+    const std::uint64_t heapSize = heap.GetSize();
+    if (heap.Type() != 0u) throw std::runtime_error("bindless sampler table buffer is invalid");
+    // No entry of the image's: nothing is sampled, so a null S# like any unbound slot.
+    resolved = DescriptorValue{};
+    resolved.dwordCount = 4u;
+    bool first = true;
+    for (const auto& [key, slot] : resolution->mapping) {
+        const std::uint64_t offset = static_cast<std::uint64_t>(table.entryOffset) + static_cast<std::uint64_t>(key) * table.entryStride;
+        if (heapSize != 0u && (offset > heapSize || heapSize - offset < SamplerBytes)) throw std::runtime_error("a bindless sampler entry lies outside its table");
+        DescriptorValue candidate;
+        candidate.dwordCount = 4u;
+        for (std::uint32_t dword = 0u; dword < 4u; ++dword) {
+            if (!runtime.readMemory(runtime.userContext, heap.Base48() + offset + dword * sizeof(std::uint32_t), &candidate.dwords[dword])) throw std::runtime_error("failed to read a bindless sampler table from memory");
+        }
+        if (first) {
+            resolved = candidate;
+            first = false;
+            continue;
+        }
+        if (candidate.dwords != resolved.dwords) throw std::runtime_error("bindless image table entries carry samplers that disagree");
+    }
 }
 
 void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {
@@ -463,7 +549,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         }
         if (plan.descriptorSources[image.source].indirectImage.has_value()) tableCount++;
     }
-    const auto tableSlots = ResourceMaterializer::BindlessSlots();
+    const auto tableSlots = tableSlotsOf(plan.descriptorSources, plan.info.images);
     if (tableCount != 0u && plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * tableCount > ShaderInfo::MaxImages) {
         rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * tableCount) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
     }
@@ -476,7 +562,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
                 tables[i].slots.assign(tableSlots, snapshot.images[i]);
                 continue;
             }
-            resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i]);
+            resolveTableImage(plan, i, *source.indirectImage, tableSlots, runtime, walker, snapshot.images[i], tables[i]);
             continue;
         }
         if (cursor >= values.size()) {
@@ -502,6 +588,18 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         throw std::runtime_error("materialization sources are missing sampler descriptors");
     }
     snapshot.samplers.assign(values.begin() + cursor, values.begin() + cursor + plan.info.samplers.size());
+    for (std::uint32_t i = 0; i < plan.info.samplers.size(); i++) {
+        const auto source = plan.info.samplers[i].source;
+        if (source >= plan.descriptorSources.size()) throw std::runtime_error("sampler resource references an unknown descriptor source");
+        const auto& table = plan.descriptorSources[source].indirectImage;
+        if (!table.has_value()) continue;
+        if (source < activeSources.size() && activeSources[source] == 0u) {
+            snapshot.samplers[i] = DescriptorValue{};
+            snapshot.samplers[i].dwordCount = 4u;
+            continue;
+        }
+        resolveTableSampler(plan, *table, runtime, walker, tables, snapshot.samplers[i]);
+    }
 }
 
 std::uint32_t colorCompareReference(IrBufferFormat format) {
@@ -585,6 +683,7 @@ std::uint32_t emulatedCompareState(const ShaderInfo& info, const ResourceSnapsho
 }
 
 void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables) {
+    const auto slots = tableSlotsOf(plan.descriptorSources, plan.info.images);
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
         const auto decoded = decodeBufferDescriptor(snapshot.buffers.at(i));
         if (decoded.Type() != 0u) throw std::runtime_error("buffer descriptor uses an unsupported type");
@@ -599,7 +698,6 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
             if (!table.slots.empty()) throw std::runtime_error("direct image has runtime table slots");
             continue;
         }
-        const auto slots = ResourceMaterializer::BindlessSlots();
         if (table.slots.size() != slots) throw std::runtime_error("runtime table size differs from the static interface");
         const auto mappingOffset = snapshot.flattenedSrt.size();
         snapshot.flattenedSrt.push_back(static_cast<std::uint32_t>(table.mapping.size()));
@@ -859,7 +957,7 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
     }
     const auto directCount = static_cast<std::uint32_t>(images.size());
     auto mappingOffset = static_cast<std::uint32_t>(resources.srtReads.size());
-    const auto slots = BindlessSlots();
+    const auto slots = tableSlotsOf(resources.descriptorSources, images);
     for (std::uint32_t index = 0u; index < directCount; ++index) {
         auto image = images[index];
         image.srgbDecodeFormats = resources.srgbDecodeFormats;
@@ -1002,7 +1100,12 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
             addSource(image.source);
         }
     }
-    for (const auto& sampler : plan.info.samplers) addSource(sampler.source);
+    for (const auto& sampler : plan.info.samplers) {
+        addSource(sampler.source);
+        // The S# comes out of a table entry at materialization; the source itself only names the
+        // table buffer.
+        if (plan.descriptorSources[sampler.source].indirectImage.has_value()) plan.requiresSpecializationMemory = true;
+    }
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     return plan;

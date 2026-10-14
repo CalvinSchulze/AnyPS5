@@ -20,10 +20,14 @@ struct BlockInfo {
 };
 
 struct DescriptorSource {
-    // A T# loaded from a table buffer (`heapSource`) at `entryOffset + key * 32`, the key a
-    // wave-uniform runtime value (handle argument `keyArg`). With `hasMaterial` the key is itself
+    // A T# loaded from a table buffer (`heapSource`) at `entryOffset + key * entryStride`, the key a
+    // wave-uniform runtime value (handle argument `keyArg`). The entry is whatever the game indexes
+    // by -- a descriptor heap of 32 byte entries, or a record of its own layout carrying a T# at
+    // `entryOffset`. With `hasMaterial` the key is itself
     // `M[readfirstlane(i) * selectorStride + selectorOffset]` over `materialSource`, so the key
-    // set can be enumerated from the material records (see ResourceMaterializer).
+    // set can be enumerated from the material records (see ResourceMaterializer). A *sampler*
+    // source carries this too when the shader loads its S# out of the same entries; there
+    // `entryOffset` is the S#'s place in the entry and the keys are the image's.
     struct IndirectImage {
         std::uint32_t materialSource = 0;
         std::uint32_t heapSource = 0;
@@ -31,6 +35,7 @@ struct DescriptorSource {
         std::uint32_t selectorOffset = 0;
         std::uint32_t keyArg = 0;
         std::uint32_t entryOffset = 0;
+        std::uint32_t entryStride = 0;
         bool hasMaterial = false;
 
         bool operator==(const IndirectImage& other) const = default;

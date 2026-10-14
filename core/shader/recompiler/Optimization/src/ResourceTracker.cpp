@@ -149,6 +149,16 @@ public:
             for (std::uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
                 plan.handle->ReplaceArgument(dword, plan.key);
             }
+            for (std::uint32_t dword = 0; dword < plan.dwordCount; dword++) {
+                if (plan.planningOnly[dword]) m_program.Resources().memoryInfo[plan.memory[dword]].planningOnly = true;
+            }
+        }
+        for (const auto& plan : m_indirectSamplers) {
+            // Nothing reads an S# handle's dwords (EmitGetSamplerResource emits none), so the
+            // table buffer stands in for them and the reads leave the program.
+            for (std::uint32_t dword = 0; dword < plan.roots.size(); dword++) {
+                plan.handle->ReplaceArgument(dword, plan.roots[dword]);
+            }
             for (const auto index : plan.memory) {
                 m_program.Resources().memoryInfo[index].planningOnly = true;
             }
@@ -156,6 +166,8 @@ public:
         std::erase_if(m_program.Metadata().dynamicReads, [&](IrValue* value) {
             const IrValue* inst = value->Resolve();
             return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
+                return plan.PlanningOnly(inst);
+            }) || std::ranges::any_of(m_indirectSamplers, [&](const IndirectSamplerPlan& plan) {
                 return std::ranges::find(plan.reads, inst) != plan.reads.end();
             });
         });
@@ -181,9 +193,45 @@ private:
         IrValue* handle = nullptr;
         std::uint32_t source = 0;
         IrValue* key = nullptr;
+        // The table this plan reads: its buffer handle, the `base + key * stride` expression the
+        // descriptor dwords share, and that base -- what a sampler out of the same entries has to
+        // match to belong to this table (see TryMakeTableSampler).
+        IrValue* heapHandle = nullptr;
+        IrValue* heapOffset = nullptr;
+        std::uint32_t heapBaseOffset = 0;
         std::array<IrValue*, 8> roots {};
+        // `memory`, `reads` and `planningOnly` hold `dwordCount` entries: a T# is four dwords with
+        // R128, eight without, and only those come from the table. A dword nothing but descriptor
+        // handles read leaves the program with the handle (`planningOnly`); one the shader also
+        // computes with -- a size out of the T#, say -- stays an ordinary read of the table buffer.
+        std::uint32_t dwordCount = 0;
         std::array<std::uint32_t, 8> memory {};
         std::array<const IrValue*, 8> reads {};
+        std::array<bool, 8> planningOnly {};
+
+        bool PlanningOnly(const IrValue* read) const {
+            for (std::uint32_t dword = 0; dword < dwordCount; dword++) {
+                if (reads[dword] == read) return planningOnly[dword];
+            }
+            return false;
+        }
+
+        bool PlanningOnlyMemory(std::uint32_t index) const {
+            for (std::uint32_t dword = 0; dword < dwordCount; dword++) {
+                if (memory[dword] == index) return planningOnly[dword];
+            }
+            return false;
+        }
+    };
+
+    // An S# read out of a table image's entries (see TryMakeTableSampler). An S# is always four
+    // dwords, so unlike an image plan this one has no width to carry.
+    struct IndirectSamplerPlan {
+        IrValue* handle = nullptr;
+        std::uint32_t source = 0;
+        std::array<IrValue*, 4> roots {};
+        std::array<std::uint32_t, 4> memory {};
+        std::array<const IrValue*, 4> reads {};
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -358,9 +406,14 @@ private:
         return true;
     }
 
-    static bool usesOnly(const IrValue& value, std::span<const IrValue* const> users) {
-        return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const IrValue* user) {
-            return std::ranges::find(users, user) != users.end();
+    // Whether nothing but descriptor handles of this shape read the value. A shader builds several
+    // descriptors out of one table entry -- the same T# sampled by several instructions, one S#
+    // serving them all -- and the translation gives each instruction its own handle, so one read
+    // has one user per instruction. Every such handle is planned on its own, and a handle this
+    // planner does not take fails exactly as it did before.
+    static bool usedOnlyByHandles(const IrValue& read, IrOpcode opcode, std::uint32_t dwords) {
+        return !read.Uses().empty() && std::ranges::all_of(read.Uses(), [&](const IrValue* user) {
+            return user->Opcode() == opcode && user->ArgumentCount() == dwords;
         });
     }
 
@@ -451,10 +504,13 @@ private:
         return stride != 0u && selector->Opcode() == IrOpcode::ReadFirstLane;
     }
 
-    // The table entry offset `key * 32` (a shift or a multiply), optionally plus an immediate.
-    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset) {
+    // The table entry offset `key * stride` (a shift or a multiply), optionally plus an immediate.
+    // The stride is whatever the game strides its entries by; whether one holds a descriptor is the
+    // caller's call.
+    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset, std::uint32_t& stride) {
         value = value->Resolve();
         entryOffset = 0;
+        stride = 0;
         if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
             std::uint32_t immediate = 0;
             if (immediateU32(value->Argument(0), immediate)) {
@@ -469,89 +525,150 @@ private:
         if (value->ArgumentCount() != 2u) {
             return false;
         }
-        std::uint32_t scale = 0;
         if (value->Opcode() == IrOpcode::ShiftLeftLogical32) {
-            if (!immediateU32(value->Argument(1), scale) || scale != 5u) {
+            std::uint32_t shift = 0;
+            if (!immediateU32(value->Argument(1), shift) || shift >= 32u) {
                 return false;
             }
+            stride = 1u << shift;
             key = value->Argument(0)->Resolve();
             return true;
         }
         if (value->Opcode() != IrOpcode::IMul32) {
             return false;
         }
-        if (immediateU32(value->Argument(1), scale)) {
+        if (immediateU32(value->Argument(1), stride)) {
             key = value->Argument(0)->Resolve();
-        } else if (immediateU32(value->Argument(0), scale)) {
+        } else if (immediateU32(value->Argument(0), stride)) {
             key = value->Argument(1)->Resolve();
         } else {
             return false;
         }
-        return scale == 32u;
+        return true;
     }
 
-    // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
-    // with a wave-uniform runtime key: a bindless image table. The key stays an ordinary value
-    // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
+    // Records the precondition that kept a T# off the bindless image table path. A rejected
+    // handle fails later as a descriptor dword that is not a runtime value; the failure replays
+    // the planner to name the table shape the planner does not match yet.
+    bool TableReject(std::string reason) {
+        m_tableReject = std::move(reason);
+        return false;
+    }
+
+    // Replaying the planner must not replace the failure it is explaining, so a throw from the
+    // replay leaves the reason out.
+    std::string TableRejectReason(IrValue& handle) {
+        m_tableReject.clear();
+        IndirectImagePlan probe;
+        try {
+            return TryMakeTableImage(handle, probe) ? std::string() : m_tableReject;
+        } catch (const std::exception&) {
+            return std::string();
+        }
+    }
+
+    // Why a descriptor dword did not look like a one dword scalar buffer read: the opcode, or the
+    // shape of the memory region behind it.
+    std::string DescribeScalarRead(const IrValue& read) const {
+        if (read.HasImmediate()) {
+            // The upper four dwords of an R128 T# are the zeroes getImageResource pads in.
+            return "an immediate";
+        }
+        if (read.Opcode() != IrOpcode::ReadConstBuffer || read.ArgumentCount() != 2u) {
+            return std::string(IrOpcodeName(read.Opcode())) + " with " + std::to_string(read.ArgumentCount()) + " arguments";
+        }
+        const std::uint32_t index = read.Flags<MemoryFlags>().index;
+        const auto& regions = m_program.Resources().memoryInfo;
+        if (index >= regions.size()) {
+            return "memory region " + std::to_string(index) + " is out of range";
+        }
+        const auto& memory = regions[index];
+        return "resource kind " + std::to_string(static_cast<int>(memory.kind)) + ", " + std::to_string(memory.dataBits) + " bits, " + std::to_string(memory.dataDwords) + " dwords";
+    }
+
+    // Whether the upper four dwords of a T# are the zeroes getImageResource pads an R128
+    // descriptor with (see MemoryResourceHelpers): an R128 T# is 128 bit, so the table holds four
+    // dwords per descriptor and the translation fills the rest with immediates.
+    static bool PaddedR128Handle(IrValue& handle) {
+        for (std::uint32_t dword = 4u; dword < 8u; dword++) {
+            std::uint32_t padding = 0;
+            if (!immediateU32(handle.Argument(dword), padding) || padding != 0u) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A T# whose dwords are scalar reads of one V# (the table) at `entryOffset + key * 32` with a
+    // wave-uniform runtime key: a bindless image table. With R128 only the leading four dwords are
+    // read, and `entryOffset` carries where the T# sits inside the table entry. The key stays an
+    // ordinary value (the SPIR-V selects the bound slot from it); the reads become planning-only.
     bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
-            return false;
+            return TableReject("the handle is not an eight dword GetImageResource");
         }
+        const std::uint32_t entryDwords = PaddedR128Handle(handle) ? 4u : 8u;
+        plan.dwordCount = entryDwords;
 
         std::array<IrValue*, 8> heapReads {};
         IrValue* heapHandle = nullptr;
         IrValue* heapOffset = nullptr;
         std::uint32_t immediateOffset = 0;
-        for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
+        for (std::uint32_t dword = 0; dword < entryDwords; dword++) {
             heapReads[dword] = handle.Argument(dword)->Resolve();
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
-            if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
-                return false;
+            if (memory == nullptr) {
+                return TableReject("descriptor dword " + std::to_string(dword) + " is not a 32 bit scalar buffer read (" + DescribeScalarRead(*heapReads[dword]) + ")");
+            }
+            if (!MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
+                return TableReject("descriptor dword " + std::to_string(dword) + " shares its memory region with another access");
             }
             if (dword == 0u) {
                 immediateOffset = memory->offset;
             } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
-                return false;
+                return TableReject("the descriptor dwords are not consecutive");
             }
             IrValue* currentHandle = heapReads[dword]->Argument(0)->Resolve();
             if (heapHandle != nullptr && currentHandle != heapHandle) {
-                return false;
+                return TableReject("the descriptor dwords read different table buffers");
             }
             heapHandle = currentHandle;
             if (dword == 0u) {
                 heapOffset = heapReads[dword]->Argument(1)->Resolve();
             } else if (!EquivalentValue(m_program.Resources(), heapOffset, heapReads[dword]->Argument(1))) {
-                return false;
+                return TableReject("the descriptor dwords use different table offsets");
             }
             plan.memory[dword] = memoryIndex;
             plan.reads[dword] = heapReads[dword];
+            plan.planningOnly[dword] = usedOnlyByHandles(*heapReads[dword], IrOpcode::GetImageResource, 8u);
         }
 
         IrValue* key = nullptr;
         std::uint32_t entryOffset = 0;
-        if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32) {
-            return false;
+        std::uint32_t entryStride = 0;
+        if (!MatchTableOffset(heapOffset, key, entryOffset, entryStride) || key->Type() != IrType::U32) {
+            return TableReject("the table offset is not a U32 key times a stride (" + std::string(IrOpcodeName(heapOffset->Resolve()->Opcode())) + " by " + std::to_string(entryStride) + ")");
+        }
+        // The entry has to hold the descriptor the loads read out of it, and a dword aligned stride
+        // keeps every entry's descriptor where the first entry had it.
+        const std::uint32_t descriptorBytes = entryDwords * static_cast<std::uint32_t>(sizeof(std::uint32_t));
+        if (entryStride < descriptorBytes || entryStride % sizeof(std::uint32_t) != 0u) {
+            return TableReject("the table entry stride " + std::to_string(entryStride) + " does not hold a " + std::to_string(descriptorBytes) + " byte descriptor");
         }
         entryOffset += immediateOffset;
-
-        const std::array<const IrValue*, 1> imageUsers {&handle};
-        for (const auto* read : heapReads) {
-            if (!usesOnly(*read, imageUsers)) {
-                return false;
-            }
-        }
 
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
         if (!MakeRuntimeBufferSource(*heapHandle, heapSourceIndex, heapSource)) {
-            return false;
+            return TableReject("the table buffer is not a runtime buffer source");
         }
 
         DescriptorSource::IndirectImage table;
         table.heapSource = heapSourceIndex;
         table.materialSource = heapSourceIndex;
         table.entryOffset = entryOffset;
+        table.entryStride = entryStride;
         DescriptorSource materialSource = heapSource;
         std::uint32_t materialMemoryIndex = 0;
         const MemoryInfo* materialMemory = ScalarReadMemory(*key, materialMemoryIndex);
@@ -579,7 +696,68 @@ private:
         plan.handle = &handle;
         plan.source = InternSource(imageSource);
         plan.key = key;
+        plan.heapHandle = heapHandle;
+        plan.heapOffset = heapOffset;
+        plan.heapBaseOffset = entryOffset - immediateOffset;
         plan.roots = imageSource.dwords;
+        return true;
+    }
+
+    // The S# a table image samples with, when the shader loads it out of the same entry: four
+    // consecutive one dword reads of the image's table buffer at the image's key. The entry's
+    // layout stays the game's -- `entryOffset` just names where the S# sits in it -- and the
+    // materializer resolves it per key, which is why the slots have to agree on one sampler.
+    bool TryMakeTableSampler(IrValue& handle, const IndirectImagePlan& image, IndirectSamplerPlan& plan) {
+        if (handle.Opcode() != IrOpcode::GetSamplerResource || handle.ArgumentCount() != 4u) {
+            return false;
+        }
+        if (image.source >= m_sources.size() || !m_sources[image.source].indirectImage.has_value()) {
+            return false;
+        }
+        std::uint32_t immediateOffset = 0;
+        for (std::uint32_t dword = 0; dword < 4u; dword++) {
+            IrValue* read = handle.Argument(dword)->Resolve();
+            std::uint32_t memoryIndex = 0;
+            const MemoryInfo* memory = ScalarReadMemory(*read, memoryIndex);
+            if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *read)) {
+                return false;
+            }
+            if (dword == 0u) {
+                immediateOffset = memory->offset;
+            } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
+                return false;
+            }
+            // The same table buffer at the same entry as the image, so the image's keys are the
+            // entries this sampler lives in.
+            if (read->Argument(0)->Resolve() != image.heapHandle || !EquivalentValue(m_program.Resources(), image.heapOffset, read->Argument(1))) {
+                return false;
+            }
+            plan.memory[dword] = memoryIndex;
+            plan.reads[dword] = read;
+        }
+
+        for (const auto* read : plan.reads) {
+            if (!usedOnlyByHandles(*read, IrOpcode::GetSamplerResource, 4u)) {
+                return false;
+            }
+        }
+
+        auto table = *m_sources[image.source].indirectImage;
+        if (table.entryStride < 4u * sizeof(std::uint32_t)) {
+            return false;
+        }
+        table.entryOffset = image.heapBaseOffset + immediateOffset;
+
+        DescriptorSource samplerSource;
+        samplerSource.dwordCount = 4u;
+        // The source evaluates to the table buffer, the way a table image's does; the S# itself
+        // comes out of an entry at materialization.
+        std::copy(m_sources[image.source].dwords.begin(), m_sources[image.source].dwords.begin() + 4u, samplerSource.dwords.begin());
+        samplerSource.indirectImage = table;
+
+        plan.handle = &handle;
+        plan.source = InternSource(samplerSource);
+        std::copy(samplerSource.dwords.begin(), samplerSource.dwords.begin() + 4u, plan.roots.begin());
         return true;
     }
 
@@ -590,11 +768,22 @@ private:
         return found == m_indirectImages.end() ? nullptr : &*found;
     }
 
+    const IndirectSamplerPlan* FindIndirectSampler(const IrValue& handle) const {
+        const auto found = std::ranges::find_if(m_indirectSamplers, [&](const IndirectSamplerPlan& plan) {
+            return plan.handle == &handle;
+        });
+        return found == m_indirectSamplers.end() ? nullptr : &*found;
+    }
+
     bool IsIndirectPlanningMemory(std::uint32_t index) const {
         return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
+            return plan.PlanningOnlyMemory(index);
+        }) || std::ranges::any_of(m_indirectSamplers, [&](const IndirectSamplerPlan& plan) {
             return std::ranges::find(plan.memory, index) != plan.memory.end();
         });
     }
+
+    std::string m_tableReject;
 
     static constexpr std::uint32_t phiSearchDepth = 8u;
 
@@ -1144,8 +1333,56 @@ private:
                 }
             }
         }
+        PlanIndirectSamplers();
         m_memoryUsersIndexed = false;
         m_memoryUsers.clear();
+    }
+
+    // The S#s that live in a planned table's entries. A table S# is not tied to the image beside
+    // it -- the same S# serves several samples, whose images may come from other tables or from
+    // the SRT -- so every sampled handle is tried against every table the program planned.
+    void PlanIndirectSamplers() {
+        if (m_indirectImages.empty()) {
+            return;
+        }
+        for (auto& block : m_program.Blocks()) {
+            for (IrValue* inst : block->Instructions()) {
+                const auto imageInfo = ImageOpcodeInfoOf(inst->Opcode());
+                if (imageInfo.access == ImageAccess::None || !imageInfo.needsSampler || inst->ArgumentCount() < 2u) {
+                    continue;
+                }
+                IrValue* handle = inst->Argument(1)->Resolve();
+                if (FindIndirectSampler(*handle) != nullptr) {
+                    continue;
+                }
+                // A sample that adjusts the descriptor needs dword 3 canonicalized at planning
+                // time, which an S# that only exists in memory cannot be.
+                const auto memoryIndex = inst->Flags<MemoryFlags>().index;
+                if (memoryIndex >= m_program.Resources().memoryInfo.size() || (m_program.Resources().memoryInfo[memoryIndex].imageSampleFlags & RdnaImageSampleFlagAdjust) != 0) {
+                    continue;
+                }
+                for (const auto& image : m_indirectImages) {
+                    IndirectSamplerPlan plan;
+                    if (TryMakeTableSampler(*handle, image, plan)) {
+                        m_indirectSamplers.push_back(std::move(plan));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // The descriptor dword that is not a runtime value, and -- for an image -- the bindless table
+    // precondition that kept the planner from taking the handle, which tells an unsupported table
+    // shape apart from a descriptor the SRT walker could not follow at all.
+    [[noreturn]] void failDescriptor(IrOpcode expected, const DescriptorSource& descriptor, std::uint32_t badDword, IrValue* handle) {
+        std::string message = std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value";
+        if (expected == IrOpcode::GetImageResource && handle != nullptr) {
+            if (const std::string reason = TableRejectReason(*handle); !reason.empty()) {
+                message += "; no bindless image table because " + reason;
+            }
+        }
+        fail(message + "; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
     }
 
     void GetHandle(IrValue* value, IrOpcode expected, std::uint32_t width, IrValue*& handle, std::uint32_t& source, bool sampler = false, bool sampleAdjust = false) {
@@ -1160,13 +1397,13 @@ private:
             for (; badDword < descriptor.dwordCount; badDword++) {
                 const IrValue* value2 = descriptor.dwords[badDword]->Resolve();
                 if (value2->Opcode() == IrOpcode::ReadConstBuffer) {
-                    fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+                    failDescriptor(expected, descriptor, badDword, handle);
                 }
             }
             badDword = 0;
         }
         if (!ValidateSource(descriptor, badDword)) {
-            fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
+            failDescriptor(expected, descriptor, badDword, handle);
         }
         source = InternSource(descriptor);
     }
@@ -1444,7 +1681,12 @@ private:
             IrValue* samplerHandle = nullptr;
             std::uint32_t samplerSource = 0;
             const bool sampleAdjust = (memory.imageSampleFlags & RdnaImageSampleFlagAdjust) != 0;
-            GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+            if (const IndirectSamplerPlan* indirectSampler = FindIndirectSampler(*inst.Argument(1)->Resolve()); indirectSampler != nullptr) {
+                samplerHandle = indirectSampler->handle;
+                samplerSource = indirectSampler->source;
+            } else {
+                GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+            }
             sampler = AddSampler(samplerSource, flags.pc);
             if (sampler == std::numeric_limits<std::uint32_t>::max()) {
                 fail("sampler resource limit exceeded");
@@ -1494,6 +1736,7 @@ private:
     // APS5_TRACE_BDA: address accesses seen by Collect (the first bdaTraceLimit are printed).
     unsigned m_bdaTraces = 0;
     std::vector<IndirectImagePlan> m_indirectImages;
+    std::vector<IndirectSamplerPlan> m_indirectSamplers;
     std::unordered_map<std::uint32_t, std::vector<const IrValue*>> m_memoryUsers;
     bool m_memoryUsersIndexed = false;
     struct EdgeSelectorEntry {
