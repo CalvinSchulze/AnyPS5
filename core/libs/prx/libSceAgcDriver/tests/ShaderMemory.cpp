@@ -750,12 +750,12 @@ void verifyBindlessTable() {
     const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
     const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     // A wave64 workgroup on a 32-wide host is held by one subgroup (two lanes per invocation).
-    const auto makeRequest = [&](const std::vector<std::uint32_t>& code) {
+    const auto makeRequestWith = [&](const std::vector<std::uint32_t>& code, std::span<const std::uint32_t> resources) {
         RecompileRequest request{};
         request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
         request.context.waveSize = 64;
         request.context.userDataBaseRegister = 0;
-        request.context.userData = userData;
+        request.context.userData = resources;
         request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
         request.target.vulkanVersion = 0x00401000u;
         request.target.spirvVersion = 0x00010300u;
@@ -767,6 +767,7 @@ void verifyBindlessTable() {
         request.layout.pushConstantSizeBytes = 128;
         return request;
     };
+    const auto makeRequest = [&](const std::vector<std::uint32_t>& code) { return makeRequestWith(code, userData); };
     const auto covered = [](const std::vector<MemoryRegion>& regions, const void* pointer, std::size_t bytes) {
         auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
         const auto end = address + bytes;
@@ -945,6 +946,89 @@ void verifyBindlessTable() {
     AgcDriver::ShaderMemory partialMemory({});
     expectFailure([&] { static_cast<void>(partialMemory.Capture(request)); }, "partial descriptor", "bindless: a partial heap descriptor was accepted");
     fillSrt(4u);
+
+    // An R128 T# out of a record array: a 128 bit descriptor is four dwords, which the translation
+    // pads to eight, and the records are 48 bytes apart with the T# at +16 inside one -- so neither
+    // the descriptor's width nor the stride is a descriptor heap's.
+    struct alignas(4096) GuestRecords {
+        std::array<std::array<std::uint32_t, 12>, 4> records{};
+        std::array<std::uint32_t, 4> output{};
+        std::array<std::uint32_t, 16> srt{};
+    };
+    static GuestRecords recordGuest;
+    const std::array<std::uint32_t, 4> recordSampler{0x49u, 0u, 0x00500000u, 0u};
+    const auto textureDwords = [&](const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u)};
+    };
+    std::array<std::array<std::uint32_t, 8>, 4> recordSlots{};
+    for (std::size_t entry = 0; entry < recordGuest.records.size(); entry++) {
+        // What surrounds the descriptors is the record's own payload, and no slot may pick it up.
+        recordGuest.records[entry].fill(0xfeedfaceu);
+        const auto texture = textureDwords(textures[entry % 2u]);
+        // The entry holds the S# the sample uses at +0 and the 128 bit T# at +16.
+        std::copy(recordSampler.begin(), recordSampler.end(), recordGuest.records[entry].begin());
+        std::copy(texture.begin(), texture.end(), recordGuest.records[entry].begin() + 4);
+        std::copy(texture.begin(), texture.end(), recordSlots[entry].begin());
+    }
+    const auto recordHeap = bufferDescriptor(recordGuest.records.data(), 48u, 4u);
+    const auto recordOutput = bufferDescriptor(recordGuest.output.data(), 0u, 16u);
+    std::copy(recordHeap.begin(), recordHeap.end(), recordGuest.srt.begin());
+    std::copy(recordOutput.begin(), recordOutput.end(), recordGuest.srt.begin() + 12);
+    const auto recordSrtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(recordGuest.srt.data()));
+    const std::array<std::uint32_t, 2> recordUserData{static_cast<std::uint32_t>(recordSrtAddress), static_cast<std::uint32_t>(recordSrtAddress >> 32u)};
+    // s_load_dwordx4 x2 (heap V#, output V#); v_readfirstlane_b32 s16, v0; s_mul_i32 s16, s16, 48;
+    // s_buffer_load_dwordx8 s[20:27], s[4:7], s16 -- S# s[20:23] and R128 T# s[24:27] out of one
+    // record; s_lshr_b32 s17, s26, 16 -- the width out of the T#, so dword 2 is a value the shader
+    // computes with and not only part of the handle; image_sample_lz v[0:3], v[0:1], s[24:27],
+    // s[20:23] with R128 set; buffer_store_dword v0, off, s[28:31], s17 -- which consumes it;
+    // s_endpgm.
+    const std::vector<std::uint32_t> recordCode{0xf4080100u, 0xfa000000u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x9310b010u, 0xf42c0502u, 0x20000000u, 0x8f91901au, 0xf09c8f08u, 0x00a60000u, 0xe0700000u, 0x11070000u, 0xbf810000u};
+    auto recordRequest = makeRequestWith(recordCode, recordUserData);
+    const auto recordPlan = GetResourcePlan(recordRequest);
+    std::size_t recordTables = 0;
+    bool imageTable = false;
+    bool samplerTable = false;
+    for (const auto& source : recordPlan->descriptorSources) {
+        if (!source.indirectImage.has_value()) continue;
+        ++recordTables;
+        const auto& table = *source.indirectImage;
+        require(!table.hasMaterial && table.entryStride == 48u, "bindless: the record table's stride was not recorded");
+        imageTable = imageTable || (table.entryOffset == 16u && source.dwordCount == 8u);
+        samplerTable = samplerTable || (table.entryOffset == 0u && source.dwordCount == 4u);
+    }
+    require(recordTables == 2 && imageTable && samplerTable, "bindless: the record's T# and S# were not both planned");
+    // The dword the shader computes with stays an ordinary read of the table buffer, so the table
+    // is bound as a buffer next to the image slots.
+    const auto tableSource = std::ranges::find_if(recordPlan->descriptorSources, [](const DescriptorSource& source) { return source.indirectImage.has_value() && source.dwordCount == 8u; });
+    require(tableSource != recordPlan->descriptorSources.end(), "bindless: the record table source is gone");
+    const auto heapSource = tableSource->indirectImage->heapSource;
+    require(std::ranges::any_of(recordPlan->info.buffers, [&](const BufferResource& buffer) { return buffer.source == heapSource; }), "bindless: the table a descriptor dword is computed from is not bound as a buffer");
+    require(std::ranges::all_of(recordPlan->info.images, [](const ImageResource& image) { return image.r128; }), "bindless: the table image lost its R128 width");
+    AgcDriver::ShaderMemory recordMemory({});
+    const auto recordCapture = recordMemory.Capture(recordRequest);
+    const auto recordDirect = static_cast<std::uint32_t>(recordPlan->info.images.size());
+    const auto recordRoot = tableRoot(*recordCapture, recordDirect);
+    const auto recordMapping = mappingOf(recordCapture->snapshot);
+    require(std::vector<std::uint32_t>(recordMapping.begin(), recordMapping.begin() + 9) == std::vector<std::uint32_t>{4u, 0u, 0u, 1u, 1u, 2u, 2u, 3u, 3u}, "bindless: the records are not the identity mapping");
+    require(recordCapture->snapshot.images[recordRoot].dwords == recordSlots[0] && recordCapture->snapshot.images[recordDirect].dwords == recordSlots[1] && recordCapture->snapshot.images[recordDirect + 1u].dwords == recordSlots[2] && recordCapture->snapshot.images[recordDirect + 2u].dwords == recordSlots[3], "bindless: a slot is not the record's T# padded with zeroes");
+    // One S# for the whole table: the slots are one image array bound against one sampler.
+    require(recordCapture->snapshot.samplers.size() == 1u && recordCapture->snapshot.samplers[0].dwordCount == 4u, "bindless: the table sampler is missing from the snapshot");
+    require(std::equal(recordSampler.begin(), recordSampler.end(), recordCapture->snapshot.samplers[0].dwords.begin()), "bindless: the sampler was not read out of the records");
+    const auto recordRegions = recordMemory.Regions();
+    for (const auto& record : recordGuest.records) {
+        require(covered(recordRegions, &record[4], 16u), "bindless: a record's descriptor was not captured");
+        require(covered(recordRegions, &record[0], 16u), "bindless: a record's sampler was not captured");
+    }
+    recordRequest.context.memory = recordRegions;
+    const auto recordCompiled = Recompile(recordRequest, *recordCapture);
+    require(!recordCompiled->spirv.empty(), "bindless: the R128 record table did not compile");
+
+    // Records whose samplers disagree cannot be bound as one sampler.
+    recordGuest.records[2][2] = 0u;
+    AgcDriver::ShaderMemory disagreeMemory({});
+    expectFailure([&] { static_cast<void>(disagreeMemory.Capture(recordRequest)); }, "samplers that disagree", "bindless: records with different samplers were bound");
+    recordGuest.records[2][2] = recordSampler[2];
 }
 
 

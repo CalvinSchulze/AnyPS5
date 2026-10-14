@@ -102,7 +102,7 @@ static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value en
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
 static_assert(sizeof(DescriptorSource) == 104, "DescriptorSource changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource::IndirectImage) == 28, "IndirectImage changed: update the plan encoder");
+static_assert(sizeof(DescriptorSource::IndirectImage) == 32, "IndirectImage changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 80, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
 static_assert(sizeof(UniformFill) == 28, "UniformFill changed: update the plan encoder");
@@ -141,7 +141,7 @@ static_assert(fieldCount<IrResourcePlan>() == 21, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 30, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<DescriptorSource::IndirectImage>() == 7, "IndirectImage changed: update the plan encoder");
+static_assert(fieldCount<DescriptorSource::IndirectImage>() == 8, "IndirectImage changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
 static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the plan encoder");
@@ -892,6 +892,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(table.selectorOffset);
         out.Value(table.keyArg);
         out.Value(table.entryOffset);
+        out.Value(table.entryStride);
         out.Value(table.hasMaterial);
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
@@ -1023,7 +1024,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         }
     }
     reader.List(plan.memoryInfo, 78, decodeMemoryInfo);
-    reader.List(plan.descriptorSources, 62, [&](Reader& in, DescriptorSource& source) {
+    reader.List(plan.descriptorSources, 66, [&](Reader& in, DescriptorSource& source) {
         for (auto& dword : source.dwords) dword = valueAt(in.Get<std::uint32_t>());
         in.Value(source.dwordCount);
         const bool indirect = in.Get<bool>();
@@ -1034,6 +1035,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(table.selectorOffset);
         in.Value(table.keyArg);
         in.Value(table.entryOffset);
+        in.Value(table.entryStride);
         in.Value(table.hasMaterial);
         source.indirectImage = indirect ? std::optional(table) : std::nullopt;
     });
